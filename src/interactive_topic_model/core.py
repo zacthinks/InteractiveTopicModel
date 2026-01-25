@@ -1,6 +1,6 @@
 """Core classes for Interactive Topic Model."""
 
-from typing import Dict, List, Optional, Tuple, Callable, Any, Union, Sequence, Iterable
+from typing import Dict, List, Optional, Tuple, Callable, Any, Type, Union, Sequence, Iterable
 from datetime import datetime
 from functools import wraps
 from contextlib import contextmanager
@@ -1045,7 +1045,7 @@ class InteractiveTopicModel:
     - Hierarchy exists only when embedding spaces differ
     """
     
-    # Special topic IDs
+    topic_cls: Type[InteractiveTopic] = InteractiveTopic
     OUTLIER_ID = -1
     
     def __init__(
@@ -1170,7 +1170,7 @@ class InteractiveTopicModel:
             InteractiveTopic instance.
         """
         if topic_id not in self.topics:
-            self.topics[topic_id] = InteractiveTopic(
+            self.topics[topic_id] = self.topic_cls(
                 itm=self, topic_id=topic_id, label=label, parent=parent
             )
             if topic_id >= self._next_topic_id:
