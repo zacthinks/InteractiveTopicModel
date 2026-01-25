@@ -1231,7 +1231,7 @@ class InteractiveTopicModel:
     
     @undoable
     def assign_doc(
-        self, doc_id: int, topic_id: int, strength: float = 1.0, validated: bool = False
+        self, doc_id: int, topic_id: int, strength: float = 1.0, validated: bool = True
     ) -> Tuple[Dict, Dict, str]:
         """
         Assign a document to a topic.
@@ -1284,6 +1284,60 @@ class InteractiveTopicModel:
         
         return forward, backward, description
     
+    @undoable
+    def manual_reassign(
+        self,
+        reassignments: Dict[Any, int],
+        *,
+        strength: float = 1.0, 
+        validated: bool = True
+    ) -> Tuple[Dict, Dict, str, Dict[str, int]]:
+        self._require_fitted()
+
+        old_assignments: Dict[int, int] = {}
+        old_strengths: Dict[int, float] = {}
+        old_validated: Dict[int, bool] = {}
+
+        new_assignments: Dict[int, int] = {}
+        new_strengths: Dict[int, float] = {}
+        new_validated: Dict[int, bool] = {}
+
+        for doc_id, topic_id in reassignments.items():
+            pos = self._pos(doc_id)
+
+            old_assignments[doc_id] = int(self._assignments[pos])
+            old_strengths[doc_id] = float(self._strengths[pos])
+            old_validated[doc_id] = bool(self._validated[pos])
+
+            self._assignments[pos] = int(topic_id)
+            new_assignments[doc_id] = int(topic_id)
+
+            self._strengths[pos] = float(strength)
+            new_strengths[doc_id] = float(strength)
+
+            if validated:
+                self._validated[pos] = True
+                new_validated[doc_id] = True
+
+        affected = set(new_assignments.values()) | set(old_assignments.values())
+        for tid in affected:
+            if tid in self.topics:
+                self.topics[tid].invalidate_representations()
+
+        forward = {"assignments": new_assignments}
+        backward = {"assignments": old_assignments}
+
+        forward["strengths"] = new_strengths
+        backward["strengths"] = old_strengths
+
+        if validated:
+            forward["validated"] = new_validated
+            backward["validated"] = old_validated
+
+        description = f"Reassigned {len(new_assignments)} documents"
+        summary = {"reassigned": len(new_assignments)}
+        return forward, backward, description, summary
+
     @undoable
     def validate_doc(self, doc_id: int) -> Tuple[Dict, Dict, str]:
         """
@@ -1389,6 +1443,109 @@ class InteractiveTopicModel:
         except Exception as e:
             print(f"Error in scoring: {e}")
             return None, 0.0
+
+    @undoable
+    def refit_docs(
+        self,
+        doc_ids: Sequence[int],
+        *,
+        mode: Optional[Union[str, Any]] = None,
+        threshold: float = 0.0,
+        validate_refits: bool = True,
+        auto_reassign: bool = False,
+    ):
+        self._require_fitted()
+
+        results = []
+        to_reassign: Dict[int, Tuple[int, float]] = {}
+
+        for doc_id in doc_ids:
+            suggested_topic_id, score = self.suggest_assignment(
+                doc_id, mode=mode, threshold=threshold
+            )
+            suggested_topic = suggested_topic_id if suggested_topic_id is not None else self.OUTLIER_ID
+            suggested_label = (
+                self.topics[suggested_topic].label if suggested_topic in self.topics else None
+            )
+            row = {
+                "doc_id": doc_id,
+                "current_topic": int(self._assignments[self._pos(doc_id)]),
+                "suggested_topic": suggested_topic,
+                "suggested_label": suggested_label,
+                "score": float(score),
+                "text": self._texts[self._pos(doc_id)],
+                "reassigned": False,
+            }
+            results.append(row)
+
+            if auto_reassign and score >= threshold:
+                to_reassign[doc_id] = (int(suggested_topic), float(score))
+
+        df = pd.DataFrame(results)
+
+        if not auto_reassign or not to_reassign:
+            return df
+
+        old_assignments: Dict[int, int] = {}
+        old_strengths: Dict[int, float] = {}
+        old_validated: Dict[int, bool] = {}
+
+        new_assignments: Dict[int, int] = {}
+        new_strengths: Dict[int, float] = {}
+        new_validated: Dict[int, bool] = {}
+
+        for doc_id, (new_tid, new_score) in to_reassign.items():
+            pos = self._pos(doc_id)
+            old_assignments[doc_id] = int(self._assignments[pos])
+            old_strengths[doc_id] = float(self._strengths[pos])
+            old_validated[doc_id] = bool(self._validated[pos])
+
+            self._assignments[pos] = int(new_tid)
+            new_assignments[doc_id] = int(new_tid)
+            self._strengths[pos] = float(new_score)
+            new_strengths[doc_id] = float(new_score)
+
+            if validate_refits:
+                self._validated[pos] = True
+                new_validated[doc_id] = True
+
+        affected = set(new_assignments.values()) | set(old_assignments.values())
+        for tid in affected:
+            if tid in self.topics:
+                self.topics[tid].invalidate_representations()
+
+        df.loc[df["doc_id"].isin(to_reassign.keys()), "reassigned"] = True
+
+        forward = {"assignments": new_assignments, "strengths": new_strengths}
+        backward = {"assignments": old_assignments, "strengths": old_strengths}
+
+        if validate_refits:
+            forward["validated"] = new_validated
+            backward["validated"] = old_validated
+
+        description = f"Refit docs: reassigned {len(new_assignments)}"
+        return forward, backward, description, df
+
+    def refit_outliers(
+        self,
+        *,
+        mode: Optional[Union[str, Any]] = None,
+        threshold: float = 0.0,
+        validate_refits: bool = True,
+        auto_reassign: bool = False,
+    ):
+        self._require_fitted()
+
+        outlier_mask = self._assignments == self.OUTLIER_ID
+        outlier_doc_ids = [int(doc_id) for doc_id in self._doc_ids[outlier_mask]]
+
+        return self.refit_docs(
+            outlier_doc_ids,
+            mode=mode,
+            threshold=threshold,
+            validate_refits=validate_refits,
+            auto_reassign=auto_reassign,
+        )
     
     # ----------------------------
     # Topic operations

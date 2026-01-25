@@ -306,6 +306,7 @@ fig.show()
 - Update vignette to demonstrate more features and navigation
 - Add serialization features
 - Add advanced semantic features (idea training, etc.)
+- Add assignment export/import features
 
 ## License
 
