@@ -1,6 +1,10 @@
 # Interactive Topic Model (ITM)
 
-An interactive topic modeling framework designed for **social science research**, where interpretability, iterative refinement, and human-in-the-loop validation are made accessible via a user-friendly interface.
+![PyPI](https://img.shields.io/pypi/v/interactive-topic-model)
+![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
+![Python Version](https://img.shields.io/pypi/pyversions/interactive-topic-model)
+
+An interactive topic modeling framework inspired by [BERTopic](https://github.com/MaartenGr/BERTopic) and designed for iterative refinement and human-in-the-loop validation. The goal is to enable better exploration of data with natural language processing tools and made accessible via a user-friendly interface. See [below](#slightly-more-detailed-blurb) for details.
 
 ## Features
 
@@ -17,6 +21,15 @@ An interactive topic modeling framework designed for **social science research**
 - **Flexible scoring**: Multiple modes for document-topic similarity (embedding, TF-IDF, harmonic mean)
 
 ## Quick Start
+### Installation
+
+```bash
+pip install interactive-topic-model
+```
+
+### Basic Use
+
+Refer to [vignette](examples\dbpedia_vignette.ipynb) for more details.
 
 ```python
 import pandas as pd
@@ -66,6 +79,18 @@ itm.undo()
 # Check undo history
 print(itm.get_history())
 ```
+
+## Slightly more detailed blurb
+
+Topic modeling is commonly treated like an objective task, that is, one that has a correct answer. In that view, the task of designing a topic model is to make it as *accurate* as possible by making it increasingly sophisticated. 
+
+I have a different view. Because texts are so rich, the range of acceptable ways to group them is very large. The question then becomes less of "Is this the correct classification?" and more of "Is this a useful/interesting classification?" This is not a question that can be answered without interpretive input, as the question of what is useful or interesting is relative to one's values and purposes. 
+
+As such, I have kept topic modeling operations (in the strict sense) very basic. The outputs to these basic topic models then serve as a basis for further exploration through interaction. In other words, topic modeling (embedding -> dimension reduction -> clustering) along with other tools like semantic search (embedding -> cosine similarity) serve as tools to augment the interpretive process, not replace it. 
+
+In line with this reasoning, ITM is also very flexible, allowing for multiple pretrained embedding models to be used in concert since each model encodes different linguistic features differently.
+
+In short, this approach empowers people to tailor topic models to their own questions and values, making ITM a tool for assisting the exploration/discovery process rather than automating it.
 
 ## Architecture
 
@@ -158,92 +183,6 @@ itm = InteractiveTopicModel(
 - `default_vectorizer()` - Balanced defaults for general use
 - `custom_vectorizer()` - Customizable n-grams, stopwords, etc.
 
-## Workflow Patterns
-
-Refer to [vignette](examples\dbpedia_vignette.ipynb) for more details.
-
-### Iterative Refinement
-
-```python
-# 1. Fit initial model
-itm.fit()
-
-# 2. Explore topics
-df = itm.get_topic_info()
-
-# 3. Split heterogeneous topics
-topic = itm.topics[5]
-preview = topic.split()
-# ... inspect preview ...
-new_topic_ids = topic.commit_split()
-
-# 4. Merge similar topics
-itm.merge_topics([7, 8, 9], into="new", new_label="Sports")
-
-# 5. Archive noise topics
-itm.archive_topic(topic_id=12)
-
-# 6. Validate good assignments
-for doc_id in good_docs:
-    itm.validate_doc(doc_id)
-```
-
-### Preview-Commit Pattern
-
-```python
-# Split returns a preview
-topic = itm.topics[0]
-preview = topic.split(
-    clusterer=HDBSCANClusterer(min_cluster_size=5)
-)
-
-# Inspect before committing
-print(f"Will create {len(preview.new_topic_ids)} new topics")
-
-# Commit when satisfied
-new_ids = topic.commit_split()
-
-# Or undo if not satisfied
-itm.undo()
-```
-
-### Validation and Refitting
-
-```python
-# Suggest assignments for unvalidated docs
-itm.suggest_assignment(doc_id=42, mode="harmonic", threshold=0.5)
-
-# Validate assignments
-itm.validate_doc(doc_id=42)
-
-# Auto-refit outliers
-itm.refit(
-    target=[itm.OUTLIER_ID],
-    mode="harmonic",
-    threshold=0.3,
-    auto_reassign=True,
-    validate_refits=True,
-)
-```
-
-## Visualization
-
-```python
-from interactive_topic_model import visualize_documents, visualize_topic_hierarchy
-
-# 2D scatter plot of documents colored by topic
-fig = visualize_documents(itm, use_reduced=True)
-fig.show()
-
-# Topic hierarchy dendrogram
-fig = visualize_topic_hierarchy(
-    itm,
-    similarity="harmonic",  # or "embedding", "tfidf"
-    include_inactive=False,
-)
-fig.show()
-```
-
 ## API Reference
 
 ### InteractiveTopicModel Methods
@@ -306,7 +245,7 @@ fig.show()
 - Update vignette to demonstrate more features and navigation
 - Add serialization features
 - Add advanced semantic features (idea training, etc.)
-- Add assignment export/import features
+- ~~Add assignment export/import features~~
 
 ## License
 

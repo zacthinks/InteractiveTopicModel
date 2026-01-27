@@ -4,10 +4,11 @@ from typing import Dict, List, Optional, Tuple, Callable, Any, Type, Union, Sequ
 from datetime import datetime
 from functools import wraps
 from contextlib import contextmanager
+import copy
 import numpy as np
 import pandas as pd
 from scipy import sparse
-from sklearn.feature_extraction.text import CountVectorizer
+from sklearn.feature_extraction.text import CountVectorizer, TfidfTransformer
 from sklearn.metrics.pairwise import cosine_similarity
 
 from .protocols import Embedder, Reducer, Clusterer, Scorer
@@ -161,7 +162,7 @@ class BasicTopicModel:
         self.scorer = scorer if scorer is not None else embedding_scorer
         
         # Set up vectorizer
-        self.vectorizer = vectorizer
+        self.vectorizer = vectorizer if vectorizer is not None else self.itm._default_vectorizer
         
         self.n_representative_docs = n_representative_docs
         
@@ -171,8 +172,10 @@ class BasicTopicModel:
         self._embeddings: Optional[np.ndarray] = None
         self._reduced_embeddings: Optional[np.ndarray] = None
         
-        # Vocabulary (if this BTM has its own vectorizer)
+        # Lexical (DTM) caches for this semantic space (only used when this BTM has a custom vectorizer)
+        self._dtm: Optional[sparse.csr_matrix] = None  # rows align to _lex_doc_id_to_pos
         self._vocabulary: Optional[List[str]] = None
+        
     
     def fit(self, doc_ids: List[int]) -> Dict[str, Any]:
         """
@@ -202,89 +205,121 @@ class BasicTopicModel:
         
         # Store vocabulary if using custom vectorizer
         if self.vectorizer is not self.itm._default_vectorizer:
+            # fit_transform builds vectorizer vocabulary scoped to these docs
+            self._dtm = self.vectorizer.fit_transform(texts)
             self._vocabulary = self.vectorizer.get_feature_names_out().tolist()
-        
+        else:
+            # bubble up to ITM lexical space
+            self._dtm = None
+            self._vocabulary = None
+            
         return {"labels": labels, "strengths": strengths}
-
-    def get_embeddings(self, doc_ids: Iterable[int]) -> Tuple[np.ndarray, np.ndarray]:
+    
+    def add_docs_to_space(self, doc_ids: Iterable[int]) -> None:
         """
-        Get embeddings for documents, computing and caching if needed.
+        Ensure the given doc_ids have rows in this BTM's local caches (embeddings, reduced, dtm),
+        appending missing rows in a single batch so that indices align.
 
-        Args:
-            doc_ids: Iterable of document IDs. Duplicates allowed and order is preserved.
-
-        Returns:
-            Tuple (embeddings, reduced_embeddings) where each is an ndarray with rows in same
-            order as doc_ids. If `doc_ids` is empty, returns two arrays with shape (0, D) and (0, d).
+        - If this BTM bubbles up its lexical space (vectorizer is global default), only embeddings
+        are appended here (DTM is left to ITM).
+        - If this BTM owns a lexical space, new DTM rows are appended with vectorizer.transform(...).
         """
-        # Fast path: empty input
         doc_ids = list(doc_ids)
         if not doc_ids:
-            # Return empty arrays consistent with existing caches if present,
-            # otherwise (0, 0) shaped arrays to avoid downstream exceptions.
-            if getattr(self, "_embeddings", None) is not None:
-                emb_dim = self._embeddings.shape[1]
-                red_dim = self._reduced_embeddings.shape[1]
-                return np.zeros((0, emb_dim)), np.zeros((0, red_dim))
+            return
+
+        # Reject duplicates (keep behavior consistent with other methods)
+        if len(doc_ids) != len(set(doc_ids)):
+            raise ValueError("add_docs_to_space() does not allow duplicate doc_ids")
+
+        # find which docs are missing locally
+        missing = [d for d in doc_ids if d not in self._doc_id_to_pos]
+        if not missing:
+            return
+
+        # compute embeddings for missing docs (texts come from ITM)
+        texts = [self.itm._texts[self.itm._pos(doc_id)] for doc_id in missing]
+        new_embeddings = self.embedder.encode(texts)  # shape (n_new, D)
+        
+        # reduce new embeddings
+        if not hasattr(self.reducer, "transform"):
+            raise RuntimeError(
+                "Reducer must implement transform() to support incremental additions. "
+                "Either use a reducer that supports transform (e.g., fitted PCA/UMAP with transform), "
+                "or avoid incremental add_docs_to_space() calls."
+        )
+        new_reduced = self.reducer.transform(new_embeddings)
+
+        # append to embeddings caches (initialize if needed)
+        if self._embeddings is None:
+            self._embeddings = new_embeddings.copy()
+            self._reduced_embeddings = new_reduced.copy()
+        else:
+            self._embeddings = np.vstack([self._embeddings, new_embeddings])
+            self._reduced_embeddings = np.vstack([self._reduced_embeddings, new_reduced])
+
+        # append to lexical DTM if this BTM owns a vectorizer
+        if self.vectorizer is not self.itm._default_vectorizer:
+            # vectorizer must already be fit (normally done in fit()); use transform for new docs
+            new_rows = self.vectorizer.transform(texts)
+            if self._dtm is None:
+                self._dtm = new_rows
+                # if vocabulary wasn't set earlier, set it now
+                if self._vocabulary is None:
+                    self._vocabulary = self.vectorizer.get_feature_names_out().tolist()
             else:
-                return np.zeros((0, 0)), np.zeros((0, 0))
-        elif len(doc_ids) != len(set(doc_ids)):
+                self._dtm = sparse.vstack([self._dtm, new_rows], format="csr")
+        # If this BTM bubbles up lexical space, do NOT touch ITM._dtm here.
+
+        # update mapping: new rows are appended at end
+        base = len(self._doc_id_to_pos)
+        for i, doc_id in enumerate(missing):
+            self._doc_id_to_pos[doc_id] = base + i
+
+    def get_embeddings(self, doc_ids: Iterable[int]) -> Tuple[np.ndarray, np.ndarray]:
+        doc_ids = list(doc_ids)
+        if not doc_ids:
+            return np.zeros((0, 0)), np.zeros((0, 0))
+
+        if len(doc_ids) != len(set(doc_ids)):
             raise ValueError("get_embeddings() does not allow duplicate doc_ids")
 
-        # Ensure fitted / caches present
-        if getattr(self, "_embeddings", None) is None or getattr(self, "_reduced_embeddings", None) is None:
-            raise RuntimeError("BTM not fitted yet")
-        
-        # Get caches
-        d = self._doc_id_to_pos
-        all_pos = []
-        uncached_ids = []
-        base = len(d)
-        uncached_pos = []
+        # ensure missing docs are added (this will append embeddings and dtm rows in lockstep)
+        missing = [d for d in doc_ids if d not in self._doc_id_to_pos]
+        if missing:
+            self.add_docs_to_space(missing)
 
-        for doc_id in doc_ids:
-            pos = d.get(doc_id)
-            if pos is None:
-                pos = base + len(uncached_pos)
-                uncached_ids.append(doc_id)
-                uncached_pos.append(pos)
-            all_pos.append(pos)
+        # now build index list and return rows (preserve order)
+        positions = [self._doc_id_to_pos[d] for d in doc_ids]
+        embeddings = self._embeddings[positions]
+        reduced = self._reduced_embeddings[positions]
+        return embeddings, reduced
+    
+    def get_lexical_dtm(self, doc_ids: Iterable[int]) -> sparse.csr_matrix:
+        doc_ids = list(doc_ids)
+        if not doc_ids:
+            width = (self._dtm.shape[1] if self._dtm is not None else (self.itm._dtm.shape[1] if self.itm._dtm is not None else 0))
+            return sparse.csr_matrix((0, width))
 
-        # Compute embeddings for uncached IDs (if any)
-        if uncached_ids:
-            # Fetch texts
-            texts = [self.itm._texts[self.itm._pos(doc_id)] for doc_id in uncached_ids]
+        if len(doc_ids) != len(set(doc_ids)):
+            raise ValueError("get_lexical_dtm() does not allow duplicate doc_ids")
 
-            # Compute embeddings and reduced embeddings
-            new_embeddings = self.embedder.encode(texts)
-            new_reduced = self.reducer.transform(new_embeddings)
+        # If lexical space is bubbled to ITM, just return rows from ITM._dtm
+        if self.vectorizer is self.itm._default_vectorizer:
+            if self.itm._dtm is None:
+                raise RuntimeError("ITM master DTM not available; did you call fit()?")
+            positions = [self.itm._pos(doc_id) for doc_id in doc_ids]
+            return self.itm._dtm[positions]
 
-            # Ensure 2D numpy arrays
-            new_embeddings = np.asarray(new_embeddings)
-            if new_embeddings.ndim == 1:
-                new_embeddings = new_embeddings.reshape(1, -1)
-            new_reduced = np.asarray(new_reduced)
-            if new_reduced.ndim == 1:
-                new_reduced = new_reduced.reshape(1, -1)
+        # Owned lexical space: ensure doc rows exist (this will call vectorizer.transform for new docs)
+        missing = [d for d in doc_ids if d not in self._doc_id_to_pos]
+        if missing:
+            # ensure embeddings and dtm rows are appended in same order
+            self.add_docs_to_space(missing)
 
-            # Append to caches efficiently
-            try:
-                self._embeddings = np.concatenate([self._embeddings, new_embeddings], axis=0)
-                self._reduced_embeddings = np.concatenate([self._reduced_embeddings, new_reduced], axis=0)
-            except ValueError:
-                # Fallback to vstack if shapes peculiar
-                self._embeddings = np.vstack([self._embeddings, new_embeddings])
-                self._reduced_embeddings = np.vstack([self._reduced_embeddings, new_reduced])
+        positions = [self._doc_id_to_pos[d] for d in doc_ids]
+        return self._dtm[positions]
 
-            # Update mapping and optional reverse list in one step
-            for doc_id, pos in zip(uncached_ids, uncached_pos):
-                d[doc_id] = pos
-
-        # Index into cache arrays (numpy advanced indexing preserves order and duplicates)
-        embeddings = self._embeddings[all_pos]
-        reduced_embeddings = self._reduced_embeddings[all_pos]
-
-        return embeddings, reduced_embeddings
     
     def compute_topic_embedding(self, doc_ids: List[int]) -> Tuple[np.ndarray, np.ndarray]:
         """
@@ -584,6 +619,9 @@ class InteractiveTopic:
         Returns:
             Label string.
         """
+        if self.topic_id == InteractiveTopicModel.OUTLIER_ID:
+            return "OUTLIERS"
+        
         top_terms = self.get_top_terms(n=n)
         if not top_terms:
             return f"Topic {self.topic_id}"
@@ -614,38 +652,40 @@ class InteractiveTopic:
         # Compute c-TF-IDF at parent level using ClassTfidfTransformer
         # This allows c-TF-IDF to be computed relative to siblings, not just this topic
         parent = self.parent
+        btm = self.semantic_space
         
         # Determine which topics to include in c-TF-IDF calculation
-        sibling_topics = [t for t in self.itm.topics.values()
-                          if t.parent == parent and t.topic_id >= 0]
+        sibling_topics = [
+            t for t in self.itm.topics.values()
+            if (t.parent == parent and t.topic_id >= 0 and t.semantic_space is btm)]
         
         # Collect all doc positions and labels for siblings
-        all_doc_positions = []
-        all_labels = []
+        all_doc_ids: List[int] = []
+        all_labels: List[int] = []
 
         for topic in sibling_topics:
-            doc_ids = topic.get_doc_ids(include_descendants=True)
-            all_doc_positions.extend(self.itm._pos(d) for d in doc_ids)
-            all_labels.extend([topic.topic_id] * len(doc_ids))
-        
-        if all_doc_positions:
-            # Get DTM for all siblings
-            parent_dtm = self.itm._dtm[all_doc_positions]
+            sib_doc_ids = topic.get_doc_ids(include_descendants=True)
+            all_doc_ids.extend(int(d) for d in sib_doc_ids)
+            all_labels.extend([int(topic.topic_id)] * len(sib_doc_ids))
+
+        if all_doc_ids:
+            # Use the BTM lexical space to get the DTM (bubbles up to ITM._dtm if needed)
+            parent_dtm = btm.get_lexical_dtm(all_doc_ids)
             labels_array = np.array(all_labels, dtype=np.int32)
-            
-            # Apply ClassTfidfTransformer
+
             ctfidf_transformer = ClassTfidfTransformer(reduce_frequent_words=False)
             ctfidf_matrix, label_to_index = ctfidf_transformer.fit_transform(parent_dtm, labels_array)
-            
-            # Get this topic's row in the c-TF-IDF matrix
+
             if self.topic_id in label_to_index:
                 topic_idx = label_to_index[self.topic_id]
                 self._cached_ctfidf = ctfidf_matrix[topic_idx].toarray().ravel()
             else:
-                # Fallback if topic not in labels (shouldn't happen)
-                self._cached_ctfidf = np.zeros(self.itm._dtm.shape[1])
+                # Topic absent (should be rare) -> zero vector with parent's lexical width
+                self._cached_ctfidf = np.zeros(parent_dtm.shape[1], dtype=float)
         else:
-            self._cached_ctfidf = np.zeros(len(btm.get_vocabulary()))
+            # No sibling docs: produce zero-length vector sized to this BTM's vocabulary
+            vocab_len = len(btm.get_vocabulary())
+            self._cached_ctfidf = np.zeros(vocab_len, dtype=float)
         
         # Get top terms
         vocabulary = btm.get_vocabulary()
@@ -689,11 +729,11 @@ class InteractiveTopic:
     def preview_split(
         self,
         *,
+        min_topic_size: int = 2,
         embedder: Optional[Union[str, Embedder]] = None,
         reducer: Optional[Reducer] = None,
         clusterer: Optional[Clusterer] = None,
-        min_topic_size: int = 2,
-        keep_outliers: bool = True,
+        vectorizer: Optional[CountVectorizer] = None,
     ) -> Optional[pd.DataFrame]:
         """
         Preview a split of this topic.
@@ -732,7 +772,7 @@ class InteractiveTopic:
                 reducer=reducer,          # default reducer inside BTM if None
                 clusterer=clusterer,      # use caller/default clusterer
                 scorer=self.itm.btm.scorer,
-                vectorizer=self.itm._default_vectorizer,
+                vectorizer=vectorizer,
                 n_representative_docs=self.itm.btm.n_representative_docs,
             )
             fit_out = split_btm.fit(doc_ids)
@@ -759,16 +799,9 @@ class InteractiveTopic:
         placeholder_prefix = f"preview-{int(self.topic_id)}"
         
         for label in unique_labels:
-            if label == -1:
-                # Outliers
-                if keep_outliers:
-                    label_to_new_id[-1] = self.topic_id  # Stay in parent
-                else:
-                    label_to_new_id[-1] = InteractiveTopicModel.OUTLIER_ID
-            else:
-                placeholder = f"{placeholder_prefix}-{label}"
-                label_to_new_id[int(label)] = placeholder
-                new_topic_ids.append(placeholder)
+            placeholder = f"{placeholder_prefix}-{label}"
+            label_to_new_id[int(label)] = placeholder
+            new_topic_ids.append(placeholder)
         
         if len(new_topic_ids) == 0:
             print("Clustering produced no valid clusters. No split proposed.")
@@ -815,9 +848,19 @@ class InteractiveTopic:
         self._split_preview = None
     
     @undoable
-    def commit_split(self) -> Tuple[Dict, Dict, str]:
+    def commit_split(
+        self, 
+        new_topic_labels: Dict[str, str]=None,
+        delete_parent: bool = False
+    ) -> Tuple[Dict, Dict, str]:
         """
         Commit the previewed split.
+
+        Args:
+            new_topic_labels: Optional mapping from preview topic IDs to labels.    
+            delete_parent: If True, *remove* the original parent topic from itm.topics and
+                        reparent the newly-created topics to this topic's parent.
+                        Not allowed if the preview created a new semantic space (preview.btm).
         
         Returns:
             Tuple of (forward_state, backward_state, description) for undo/redo.
@@ -826,9 +869,14 @@ class InteractiveTopic:
             raise ITMError("No split preview to commit. Call preview_split() first.")
         
         preview = self._split_preview
+        new_topic_labels = new_topic_labels or {}
 
         old_btm = self.btm
         new_btm = getattr(preview, "btm", None)
+    
+        # If the preview created a new semantic space, we cannot delete the parent.
+        if delete_parent and new_btm is not None:
+            raise ITMError("Cannot delete parent when the preview created a new semantic space.")
         
         # Verify no documents have changed assignment since preview
         for doc_id in preview.proposed_assignments.keys():
@@ -845,6 +893,8 @@ class InteractiveTopic:
         placeholder_to_real: Dict[object, int] = {}
         real_new_topic_ids: list[int] = []
 
+        parent_for_new_topics = self.parent if (delete_parent or (self.topic_id == self.itm.OUTLIER_ID)) else self
+
         for pid in preview.new_topic_ids:
             # If it's already an int (e.g., parent topic id or OUTLIER_ID), skip
             if isinstance(pid, int):
@@ -855,7 +905,10 @@ class InteractiveTopic:
                 placeholder_to_real[pid] = new_real
                 real_new_topic_ids.append(new_real)
                 # ensure topic record exists (parent=self)
-                self.itm._ensure_topic(new_real, parent=self)
+                self.itm._ensure_topic(
+                    new_real, 
+                    parent=parent_for_new_topics, 
+                    label=new_topic_labels.get(str(pid), None))
             else:
                 # unknown type (conservative approach: treat as error)
                 raise ITMError(f"Unknown preview topic id format: {pid!r}")
@@ -900,29 +953,118 @@ class InteractiveTopic:
         # Clear preview
         self._split_preview = None
 
-        # Deactivate old topic
-        self.active = False
-        
         # Prepare undo/redo state
         forward = {
             "assignments": final_assignments.copy(),
             "strengths": preview.proposed_strengths.copy(),
             "new_topics": real_new_topic_ids.copy(),
-            "deactivate_topics": [self.topic_id],
         }
 
         backward = {
             "assignments": old_assignments,
             "strengths": old_strengths,
             "remove_topics": real_new_topic_ids.copy(),
-            "reactivate_topics": [self.topic_id],
         }
+        if delete_parent:
+            # Gather children *before* we remove the topic so we can restore links later.
+            children_ids = [t.topic_id for t in self.itm.topics.values() if getattr(t, "parent", None) is self]
+
+            # Make a deep copy of the topic object so future mutations won't affect the undo snapshot
+            topic_snapshot = copy.deepcopy(self)
+
+            # Remove the topic object from itm.topics (this is the deletion)
+            removed_obj = self.itm.topics.pop(self.topic_id, None)
+
+            # Save full snapshot + relational metadata for undo
+            backward.setdefault("restore_topics", {})[self.topic_id] = {
+                "topic_snapshot": topic_snapshot,
+                "parent_id": getattr(self.parent, "topic_id", None),
+                "child_ids": children_ids,
+            }
+            forward.setdefault("deleted_topics", []).append(self.topic_id)
+        else:
+            # Deactivate old topic if all docs moved out (preserve previous logic)
+            if self.get_count(include_descendants=False) == 0:
+                self.active = False
+                forward.setdefault("deactivate_topics", []).append(self.topic_id)
+                backward.setdefault("reactivate_topics", []).append(self.topic_id)
+
+                if self.topic_id != self.itm.OUTLIER_ID:
+                    old_label = self._label
+                    self._label = "[SPLIT] " + old_label
+                    forward.setdefault("topic_labels", {})[self.topic_id] = self._label
+                    backward.setdefault("topic_labels", {})[self.topic_id] = old_label
 
         if new_btm is not None or old_btm is not None:
             forward["topic_btms"] = {self.topic_id: new_btm}
             backward["topic_btms"] = {self.topic_id: old_btm}
         
         description = f"Split topic {self.topic_id} into {len(real_new_topic_ids)} new topics"
+        
+        return forward, backward, description
+
+    @undoable
+    def junk(self) -> Tuple[Dict, Dict, str]:
+        """
+        Mark this topic as junk by moving all documents to outliers,
+        relabeling it as [JUNK], and deactivating it.
+        """
+        # Get all document IDs from this topic (not including descendants)
+        doc_ids = self.get_doc_ids(include_descendants=False)
+        
+        if not doc_ids:
+            raise ITMError(f"Topic {self.topic_id} has no documents to junk")
+        
+        # Get mask and positions for vectorized operations
+        mask = self._get_doc_mask(include_descendants=False)
+        positions = np.where(mask)[0]
+        
+        # Store old values for undo/redo tracking
+        old_assignments_array = self.itm._assignments[positions].copy()
+        old_strengths_array = self.itm._strengths[positions].copy()
+        
+        # Vectorized assignment to outliers
+        self.itm._assignments[positions] = self.itm.OUTLIER_ID
+        self.itm._strengths[positions] = 0.0
+        
+        # Build dictionaries for state tracking
+        old_assignments = dict(zip(doc_ids, old_assignments_array))
+        old_strengths = dict(zip(doc_ids, old_strengths_array))
+        new_assignments = {doc_id: self.itm.OUTLIER_ID for doc_id in doc_ids}
+        new_strengths = {doc_id: 0.0 for doc_id in doc_ids}
+        
+        # Update label
+        old_label = self._label
+        new_label = "[JUNK] " + (old_label if old_label else f"Topic {self.topic_id}")
+        self._label = new_label
+        
+        # Deactivate topic
+        old_active = self.active
+        self.active = False
+        
+        # Invalidate representations for this topic and outliers
+        self.invalidate_representations()
+        if self.itm.OUTLIER_ID in self.itm.topics:
+            self.itm.topics[self.itm.OUTLIER_ID].invalidate_representations()
+        
+        # Build forward and backward states
+        forward = {
+            "assignments": new_assignments,
+            "strengths": new_strengths,
+            "topic_labels": {self.topic_id: new_label},
+            "deactivate_topics": [self.topic_id],
+        }
+        
+        backward = {
+            "assignments": old_assignments,
+            "strengths": old_strengths,
+            "topic_labels": {self.topic_id: old_label},
+        }
+        
+        if old_active:
+            backward["reactivate_topics"] = [self.topic_id]
+        
+        description = f"Junked topic {self.topic_id}, moved {len(doc_ids)} documents to outliers"
         
         return forward, backward, description
 
@@ -1110,6 +1252,7 @@ class InteractiveTopicModel:
         # Master DTM and vocabulary (computed once during fit)
         self._dtm: Optional[sparse.csr_matrix] = None
         self._vocabulary: Optional[List[str]] = None
+        self._tfidf_transformer: Optional[TfidfTransformer] = None
         
         # Undo/redo support
         self._undo_stack: List[Edit] = []
@@ -1185,7 +1328,49 @@ class InteractiveTopicModel:
     def semantic_space(self) -> BasicTopicModel:
         """Return root BTM."""
         return self.btm
+
+    @property
+    def outlier_topic(self) -> InteractiveTopic:
+        """Return outlier topic."""
+        return self.topics[self.OUTLIER_ID]
     
+    def topics_in_semantic_space(self, space_btm) -> List["InteractiveTopic"]:
+        """All active (non-outlier) topics whose semantic_space is `space_btm`."""
+        return [
+            t for t in self.topics.values()
+            if t.topic_id >= 0 and t.semantic_space is space_btm
+        ]
+
+    def children_in_space(self, parent: "InteractiveTopic", space_btm) -> List["InteractiveTopic"]:
+        """Children of `parent` that share the given semantic space."""
+        return [
+            c for c in self.topics.values()
+            if (
+                c.topic_id >= 0
+                and c.parent is parent
+                and c.semantic_space is space_btm
+            )
+        ]
+
+    def frontier_topics_in_space(self, space_btm) -> List["InteractiveTopic"]:
+        """
+        Topics in this semantic space that have NO children in the same space.
+        (Avoids assigning to empty/group container topics.)
+        """
+        topics = self.topics_in_semantic_space(space_btm)
+        frontier = []
+        for t in topics:
+            if not self.children_in_space(t, space_btm):
+                frontier.append(t)
+        return frontier
+    
+    def assignment_candidates(self, space_btm, *, prefer_frontier: bool = True):
+        topics = self.topics_in_semantic_space(space_btm)
+        if not prefer_frontier:
+            return topics
+        frontier = self.frontier_topics_in_space(space_btm)
+        return frontier if frontier else topics
+
     # ----------------------------
     # Fit operation
     # ----------------------------
@@ -1204,6 +1389,10 @@ class InteractiveTopicModel:
         texts = [self._texts[i] for i in range(len(self._texts))]
         self._dtm = self._default_vectorizer.fit_transform(texts)
         self._vocabulary = self._default_vectorizer.get_feature_names_out().tolist()
+        
+        # Fit TF-IDF transformer for document scoring
+        self._tfidf_transformer = TfidfTransformer()
+        self._tfidf_transformer.fit(self._dtm)
         
         # Fit BTM
         result = self.btm.fit(doc_ids)
@@ -1363,7 +1552,6 @@ class InteractiveTopicModel:
     # ----------------------------
     # Suggest assignment
     # ----------------------------
-    
     def suggest_assignment(
         self,
         doc_id: int,
@@ -1372,33 +1560,21 @@ class InteractiveTopicModel:
         threshold: float = 0.0,
     ) -> Tuple[Optional[int], float]:
         """
-        Suggest best topic for a document.
-        
-        Args:
-            doc_id: Document ID.
-            mode: Scoring mode ('embedding', 'tfidf', 'harmonic', or callable).
-            threshold: Minimum score to return suggestion.
-            
-        Returns:
-            Tuple of (suggested_topic_id, score) or (None, 0.0) if below threshold.
+        Suggest best LEAF topic for a document, respecting semantic spaces.
+
+        Threshold is applied ONLY at the end (on the final leaf score).
         """
         self._require_fitted()
-        
-        # Get active topics
-        active_topics = [t for t in self.topics.values() if t.active and t.topic_id >= 0]
-        
-        if not active_topics:
-            return None, 0.0
-        
-        # Get document position
+
+        # doc representations that are global
         pos = self._pos(doc_id)
-        
-        # Get document representations
-        doc_embedding = self.btm._embeddings[pos] if self.btm._embeddings is not None else None
-        
-        # Get document TF-IDF (would need to vectorize single doc, simplified for now)
-        doc_tfidf = None
-        
+
+        # TF-IDF stays global (master DTM)
+        if self._tfidf_transformer is not None and self._dtm is not None:
+            doc_tfidf = self._tfidf_transformer.transform(self._dtm[pos]).toarray().ravel()
+        else:
+            doc_tfidf = None
+
         # Determine scorer
         if mode is None or mode == "embedding":
             scorer = embedding_scorer
@@ -1410,39 +1586,53 @@ class InteractiveTopicModel:
             scorer = mode
         else:
             raise ValueError(f"Unknown scoring mode: {mode}")
-        
-        # Collect topic representations
-        topic_ids = []
-        topic_embeddings_list = []
-        topic_ctfidfs_list = []
-        
-        for topic in active_topics:
-            emb = topic.get_embedding()
-            ctfidf = topic.get_ctfidf()
-            
-            topic_ids.append(topic.topic_id)
-            topic_embeddings_list.append(emb)
-            topic_ctfidfs_list.append(ctfidf)
-        
-        if not topic_ids:
-            return None, 0.0
-        
-        topic_embeddings = np.array(topic_embeddings_list)
-        topic_ctfidfs = np.array(topic_ctfidfs_list) if topic_ctfidfs_list else None
-        
-        # Score
-        try:
+
+        # descend through semantic spaces until a leaf
+        space_btm = self.btm  # start at root semantic space
+        best_leaf_id: Optional[int] = None
+        best_leaf_score: float = 0.0
+
+        while True:
+            candidates = self.assignment_candidates(space_btm, prefer_frontier=True)
+            if not candidates:
+                break
+
+            # IMPORTANT: embed the doc in the CURRENT semantic space, not root
+            doc_emb, _ = space_btm.get_embeddings([doc_id])
+            doc_embedding = doc_emb[0] if doc_emb.size else None
+
+            topic_ids = []
+            topic_embs = []
+            topic_cts = []
+            for t in candidates:
+                topic_ids.append(t.topic_id)
+                topic_embs.append(t.get_embedding())
+                topic_cts.append(t.get_ctfidf())
+
+            topic_embeddings = np.asarray(topic_embs)
+            topic_ctfidfs = np.asarray(topic_cts) if topic_cts else None
+
             scores = scorer(doc_embedding, doc_tfidf, topic_embeddings, topic_ctfidfs)
-            best_idx = np.argmax(scores)
-            best_score = scores[best_idx]
-            
-            if best_score >= threshold:
-                return topic_ids[best_idx], float(best_score)
-            else:
-                return None, 0.0
-        except Exception as e:
-            print(f"Error in scoring: {e}")
+            best_idx = int(np.argmax(scores))
+            best_id = int(topic_ids[best_idx])
+            best_score = float(scores[best_idx])
+
+            best_topic = self.topics[best_id]
+
+            # If we can descend, do so (ignore threshold until the end)
+            if best_topic.btm is not None:
+                space_btm = best_topic.btm
+                continue
+
+            # Otherwise, we've reached a leaf in this descent path
+            best_leaf_id = best_id
+            best_leaf_score = best_score
+            break
+
+        # Apply threshold ONLY at the end
+        if best_leaf_id is None or best_leaf_score < threshold:
             return None, 0.0
+        return best_leaf_id, best_leaf_score
 
     @undoable
     def refit_docs(
@@ -1453,6 +1643,7 @@ class InteractiveTopicModel:
         threshold: float = 0.0,
         validate_refits: bool = True,
         auto_reassign: bool = False,
+        export_path: Optional[str] = None,
     ):
         self._require_fitted()
 
@@ -1482,6 +1673,10 @@ class InteractiveTopicModel:
                 to_reassign[doc_id] = (int(suggested_topic), float(score))
 
         df = pd.DataFrame(results)
+
+        if export_path is not None:
+            df['reassigned_topic_id'] = ''
+            df.to_csv(export_path, index=False)
 
         if not auto_reassign or not to_reassign:
             return df
@@ -1533,6 +1728,7 @@ class InteractiveTopicModel:
         threshold: float = 0.0,
         validate_refits: bool = True,
         auto_reassign: bool = False,
+        export_path: Optional[str] = None,
     ):
         self._require_fitted()
 
@@ -1545,6 +1741,7 @@ class InteractiveTopicModel:
             threshold=threshold,
             validate_refits=validate_refits,
             auto_reassign=auto_reassign,
+            export_path=export_path,
         )
     
     # ----------------------------
@@ -1749,7 +1946,10 @@ class InteractiveTopicModel:
     # Information retrieval
     # ----------------------------
     
-    def get_topic_info(self, top_words_n: int = 10, show_inactive: bool = False, show_outliers: bool = True) -> pd.DataFrame:
+    def get_topic_info(self,
+                       top_words_n: int = 10, 
+                       show_inactive: bool = False,
+                       show_outliers: bool = True) -> pd.DataFrame:
         """
         Get summary information for topics.
         
@@ -1764,7 +1964,8 @@ class InteractiveTopicModel:
         
         rows = []
         for topic_id, topic in self.topics.items():
-            if (not topic.active and not show_inactive) or (topic_id < 0 and not show_outliers):
+            if ((topic_id != self.OUTLIER_ID and not topic.active and not show_inactive) 
+                or (topic_id == self.OUTLIER_ID and not show_outliers)):
                 continue
             
             count = topic.get_count(include_descendants=True)
@@ -1782,7 +1983,7 @@ class InteractiveTopicModel:
         
         df = pd.DataFrame(rows)
         if not df.empty:
-            df = df.sort_values("count", ascending=False)
+            df = df.sort_values("topic_id")
         return df
 
     def get_representative_documents(
@@ -2275,6 +2476,44 @@ class InteractiveTopicModel:
                 for topic_id, btm in state["topic_btms"].items():
                     if topic_id in self.topics:
                         self.topics[topic_id].btm = btm
+
+            # --- Handle deletion / restoration of full topic snapshots ---
+            # Forward key: "deleted_topics" -> remove the topic id(s)
+            if "deleted_topics" in state:
+                for tid in state["deleted_topics"]:
+                    # remove if present
+                    self.topics.pop(tid, None)
+
+            # Backward/restore key: "restore_topics" -> re-insert deep-copied snapshots
+            if "restore_topics" in state:
+                for tid, meta in state["restore_topics"].items():
+                    topic_snapshot = meta["topic_snapshot"]
+                    parent_id = meta["parent_id"]
+                    child_ids = meta.get("child_ids", [])
+
+                    # Reattach snapshot to this ITM
+                    topic_snapshot.itm = self
+                    topic_snapshot.topic_id = tid
+                    self.topics[tid] = topic_snapshot
+
+                    # Restore parent
+                    if parent_id is None:
+                        # Root-level topic
+                        topic_snapshot.parent = self
+                    else:
+                        parent_topic = self.topics.get(parent_id)
+                        topic_snapshot.parent = parent_topic if parent_topic is not None else self
+
+                    # Restore children
+                    for cid in child_ids:
+                        child = self.topics.get(cid)
+                        if child is not None:
+                            child.parent = topic_snapshot
+
+                    # Ensure topic id counter stays monotonic
+                    if tid >= self._next_topic_id:
+                        self._next_topic_id = tid + 1
+
     
     def get_history(
         self, stack: str = "undo", reverse: bool = True, include_timestamp: bool = True
@@ -2398,3 +2637,103 @@ class InteractiveTopicModel:
             linkagefun=linkagefun,
             save_path=save_path,
         )
+
+    @undoable
+    def import_assignments(
+        self,
+        data: Union[str, pd.DataFrame],
+        validate_imports: bool = True,
+    ) -> Tuple[Dict, Dict, str]:
+        """
+        Import document reassignments from CSV or DataFrame.
+        
+        Args:
+            data: CSV file path or pandas DataFrame.
+            validate_imports: If True, mark reassigned documents as validated.
+            
+        Returns:
+            Tuple of (forward_state, backward_state, description) for undo/redo.
+        """
+        self._require_fitted()
+        
+        # Load DataFrame
+        if isinstance(data, str):
+            df = pd.read_csv(data)
+        else:
+            df = data.copy()
+        
+        # Validate required columns
+        required_cols = ["doc_id", "reassigned_topic_id"]
+        missing_cols = [col for col in required_cols if col not in df.columns]
+        if missing_cols:
+            raise ValueError(f"Missing required columns: {missing_cols}")
+        
+        # Validate doc_ids exist
+        valid_doc_ids = set(self._doc_ids)
+        invalid_doc_ids = df[~df["doc_id"].isin(valid_doc_ids)]["doc_id"].tolist()
+        if invalid_doc_ids:
+            raise ValueError(f"Unknown doc_ids: {invalid_doc_ids}")
+        
+        # Validate reassigned_topic_ids exist
+        valid_topic_ids = set(self.topics.keys())
+        non_null_reassigned = df["reassigned_topic_id"].dropna().astype(int)
+        invalid_topic_ids = non_null_reassigned[~non_null_reassigned.isin(valid_topic_ids)].tolist()
+        if invalid_topic_ids:
+            raise ValueError(f"Unknown topic_ids: {invalid_topic_ids}")
+        
+        # Prepare state tracking
+        old_assignments: Dict[int, int] = {}
+        old_strengths: Dict[int, float] = {}
+        old_validated: Dict[int, bool] = {}
+        
+        new_assignments: Dict[int, int] = {}
+        new_strengths: Dict[int, float] = {}
+        new_validated: Dict[int, bool] = {}
+        
+        # Apply reassignments
+        for _, row in df.iterrows():
+            doc_id = int(row["doc_id"])
+            new_topic_id = int(row["reassigned_topic_id"])
+            
+            # Skip if reassigned_topic_id is NaN/None
+            if pd.isna(new_topic_id):
+                continue
+            
+            pos = self._pos(doc_id)
+            
+            # Store old values
+            old_assignments[doc_id] = int(self._assignments[pos])
+            old_strengths[doc_id] = float(self._strengths[pos])
+            old_validated[doc_id] = bool(self._validated[pos])
+            
+            # Apply new assignment
+            self._assignments[pos] = new_topic_id
+            new_assignments[doc_id] = new_topic_id
+            
+            # Keep existing strength or set to 1.0 if not available
+            strength = 1.0
+            self._strengths[pos] = strength
+            new_strengths[doc_id] = strength
+            
+            # Mark as validated if requested
+            if validate_imports:
+                self._validated[pos] = True
+                new_validated[doc_id] = True
+        
+        # Invalidate representations for affected topics
+        affected_topics = set(new_assignments.values()) | set(old_assignments.values())
+        for tid in affected_topics:
+            if tid in self.topics:
+                self.topics[tid].invalidate_representations()
+        
+        # Build forward/backward states
+        forward = {"assignments": new_assignments, "strengths": new_strengths}
+        backward = {"assignments": old_assignments, "strengths": old_strengths}
+        
+        if validate_imports and new_validated:
+            forward["validated"] = new_validated
+            backward["validated"] = old_validated
+        
+        description = f"Imported assignments for {len(new_assignments)} documents"
+        
+        return forward, backward, description

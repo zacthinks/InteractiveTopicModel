@@ -46,3 +46,5 @@ Thumbs.db
 
 tests/
 .github/
+
+examples/dbpedia_sampled.csv

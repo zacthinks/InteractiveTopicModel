@@ -142,14 +142,15 @@ def _scatter_by_similarity(
         x="x",
         y="y",
         color="similarity",
-        custom_data=["hover_text", "doc_id", "similarity"],
+        custom_data=["hover_text", "doc_id", "topic", "similarity"],
         title=title,
         labels={"similarity": "Cosine similarity"},
     )
     fig.update_traces(
         hovertemplate=(
             "<b>doc_id:</b> %{customdata[1]}<br>"
-            "<b>similarity:</b> %{customdata[2]:.3f}<br>"
+            "<b>topic:</b> %{customdata[2]}<br>"
+            "<b>similarity:</b> %{customdata[3]:.3f}<br>"
             "<b>text:</b> %{customdata[0]}<extra></extra>"
         ),
         marker=dict(size=7, opacity=0.8),
@@ -296,6 +297,7 @@ def visualize_topic_hierarchy(
     fig = ff.create_dendrogram(
         topic_matrix,
         labels=labels,
+        orientation='left',
         linkagefun=lambda x: Z,
     )
     
