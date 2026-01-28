@@ -518,17 +518,6 @@ class InteractiveTopic:
         """Get document texts belonging to this topic."""
         mask = self._get_doc_mask(include_descendants)
         return [self.itm._texts[i] for i in np.where(mask)[0]]
-    
-    def get_doc_from_id(self, doc_id: int) -> str:
-        """
-        Return the raw text for a given document id.
-        """
-        doc_id = int(doc_id)
-        try:
-            pos = self._pos(doc_id)
-        except Exception:
-            raise KeyError(f"Unknown doc_id: {doc_id}")
-        return self._texts[pos]
 
     def get_examples(
         self,
@@ -639,6 +628,122 @@ class InteractiveTopic:
         terms = [term for term, _ in top_terms[:n]]
         return f"{self.topic_id}_{'_'.join(terms)}"
     
+    def get_doc_diagnostics(
+        self,
+        *,
+        include_descendants: bool = True,
+        max_pairwise_docs: int = 3000,
+        sample_k: int = 400,
+        random_state: Optional[int] = 42,
+    ) -> pd.DataFrame:
+        """
+        Return per-document diagnostics for this topic.
+
+        Metrics:
+        - sim_to_center: cosine similarity between each doc embedding and the topic embedding
+        - mean_sim_to_others: mean cosine similarity to other docs in the topic
+        - median_sim_to_others: median cosine similarity to other docs in the topic
+
+        Notes:
+        - If n_docs <= max_pairwise_docs: mean/median are computed exactly via full pairwise matrix.
+        - If n_docs > max_pairwise_docs: mean/median are approximated by sampling up to sample_k
+            other docs per doc (to avoid O(n^2) memory/time).
+
+        Args:
+            include_descendants: include docs from descendant topics.
+            max_pairwise_docs: threshold for exact O(n^2) computation.
+            sample_k: sample size per doc for approximate mean/median when topic is large.
+            random_state: RNG seed for sampling stability.
+
+        Returns:
+            pd.DataFrame with one row per doc.
+        """
+        self.itm._require_fitted()
+
+        doc_ids = [int(d) for d in self.get_doc_ids(include_descendants=include_descendants)]
+        if not doc_ids:
+            return pd.DataFrame(
+                columns=[
+                    "doc_id",
+                    "topic_id",
+                    "label",
+                    "sim_to_center",
+                    "mean_sim_to_others",
+                    "median_sim_to_others",
+                    "text",
+                ]
+            )
+
+        # Embeddings for docs in this topic
+        btm = self.semantic_space
+        doc_embeddings, _ = btm.get_embeddings(doc_ids)  # (n, dim)
+
+        # Topic embedding (cached)
+        topic_emb = self.get_embedding().reshape(1, -1)
+
+        # Similarity to center
+        sim_to_center = cosine_similarity(doc_embeddings, topic_emb).ravel()
+
+        n = len(doc_ids)
+        mean_sim = np.full(n, np.nan, dtype=float)
+        median_sim = np.full(n, np.nan, dtype=float)
+
+        if n == 1:
+            # no "others" to compare to
+            pass
+        elif n <= max_pairwise_docs:
+            S = cosine_similarity(doc_embeddings)  # (n, n)
+            np.fill_diagonal(S, np.nan)
+            mean_sim = np.nanmean(S, axis=1)
+            median_sim = np.nanmedian(S, axis=1)
+        else:
+            # Approximate by sampling to avoid O(n^2)
+            rng = np.random.default_rng(random_state)
+
+            # Normalize embeddings once so cosine(u,v) == dot(u,v)
+            norms = np.linalg.norm(doc_embeddings, axis=1, keepdims=True)
+            safe_norms = np.where(norms == 0.0, 1.0, norms)
+            E = doc_embeddings / safe_norms
+
+            k = min(sample_k, n - 1)
+            for i in range(n):
+                if k <= 0:
+                    continue
+
+                # sample other indices excluding i
+                idx = rng.integers(0, n, size=k + 8)
+                idx = idx[idx != i]
+                if len(idx) < k:
+                    candidates = np.array([j for j in range(n) if j != i], dtype=int)
+                    if len(candidates) > k:
+                        idx = rng.choice(candidates, size=k, replace=False)
+                    else:
+                        idx = candidates
+                else:
+                    idx = idx[:k]
+
+                sims = E[i].dot(E[idx].T)
+                mean_sim[i] = float(np.mean(sims))
+                median_sim[i] = float(np.median(sims))
+
+        texts = [self.itm._texts[self.itm._pos(d)] for d in doc_ids]
+
+        df = pd.DataFrame(
+            {
+                "doc_id": doc_ids,
+                "topic_id": int(self.topic_id),
+                "label": self.label,
+                "sim_to_center": sim_to_center,
+                "mean_sim_to_others": mean_sim,
+                "median_sim_to_others": median_sim,
+                "text": texts,
+            }
+        )
+
+        # Put the most suspicious docs at the top
+        df = df.sort_values(["sim_to_center", "mean_sim_to_others"], ascending=[True, True]).reset_index(drop=True)
+        return df
+
     def _compute_representations(self) -> None:
         """
         Compute and cache all topic representations.
@@ -2265,6 +2370,17 @@ class InteractiveTopicModel:
     # ----------------------------
     # Information retrieval
     # ----------------------------
+    
+    def get_doc_from_id(self, doc_id: int) -> str:
+        """
+        Return the raw text for a given document id.
+        """
+        doc_id = int(doc_id)
+        try:
+            pos = self._pos(doc_id)
+        except Exception:
+            raise KeyError(f"Unknown doc_id: {doc_id}")
+        return self._texts[pos]
     
     def get_topic_info(self,
                        top_words_n: int = 10, 
