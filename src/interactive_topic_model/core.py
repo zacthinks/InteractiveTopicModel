@@ -519,6 +519,17 @@ class InteractiveTopic:
         mask = self._get_doc_mask(include_descendants)
         return [self.itm._texts[i] for i in np.where(mask)[0]]
     
+    def get_doc_from_id(self, doc_id: int) -> str:
+        """
+        Return the raw text for a given document id.
+        """
+        doc_id = int(doc_id)
+        try:
+            pos = self._pos(doc_id)
+        except Exception:
+            raise KeyError(f"Unknown doc_id: {doc_id}")
+        return self._texts[pos]
+
     def get_examples(
         self,
         n: int = 10,
@@ -1526,6 +1537,100 @@ class InteractiveTopicModel:
         description = f"Reassigned {len(new_assignments)} documents"
         summary = {"reassigned": len(new_assignments)}
         return forward, backward, description, summary
+
+    @undoable
+    def assign_docs_to_topic(
+        self,
+        doc_ids: List[int],
+        topic_id: int,
+        *,
+        set_validation: Optional[bool] = None,
+    ) -> Tuple[Dict, Dict, str]:
+        """
+        Assign the given documents to a topic.
+
+        Args:
+            doc_ids: iterable of document ids.
+            topic_id: target topic id (must exist, or be OUTLIER_ID).
+            set_validation:
+                - None: do not change validation status
+                - True / False: set validation status for these docs
+
+        Returns:
+            (forward_state, backward_state, description)
+        """
+        self._require_fitted()
+
+        topic_id = int(topic_id)
+        doc_ids = [int(d) for d in doc_ids]
+
+        if topic_id != self.OUTLIER_ID and topic_id not in self.topics:
+            raise KeyError(f"Unknown topic_id: {topic_id}")
+
+        forward: Dict[str, Any] = {}
+        backward: Dict[str, Any] = {}
+
+        forward_assignments: Dict[int, int] = {}
+        backward_assignments: Dict[int, int] = {}
+
+        forward_validated: Dict[int, bool] = {}
+        backward_validated: Dict[int, bool] = {}
+
+        affected_topics = set()
+
+        for doc_id in doc_ids:
+            pos = self._pos(doc_id)
+            old_tid = int(self._assignments[pos])
+
+            # --- assignment ---
+            if old_tid != topic_id:
+                backward_assignments[doc_id] = old_tid
+                forward_assignments[doc_id] = topic_id
+                self._assignments[pos] = topic_id
+                affected_topics.add(old_tid)
+                affected_topics.add(topic_id)
+
+            # --- validation ---
+            if set_validation is not None:
+                old_val = bool(self._validated[pos])
+                if old_val != bool(set_validation):
+                    backward_validated[doc_id] = old_val
+                    forward_validated[doc_id] = bool(set_validation)
+                    self._validated[pos] = bool(set_validation)
+
+        # Invalidate representations for affected topics
+        for tid in affected_topics:
+            if tid in self.topics:
+                self.topics[tid].invalidate_representations()
+
+        if forward_assignments:
+            forward["assignments"] = forward_assignments
+            backward["assignments"] = backward_assignments
+
+        if set_validation is not None and forward_validated:
+            forward["validated"] = forward_validated
+            backward["validated"] = backward_validated
+
+        desc = f"Assigned {len(forward_assignments)} docs to topic {topic_id}"
+        if set_validation is not None:
+            desc += f" (validation set to {set_validation})"
+
+        return forward, backward, desc
+
+    def assign_docs_to_outlier(
+        self,
+        doc_ids: List[int],
+        *,
+        set_validation: Optional[bool] = None,
+    ):
+        """
+        Assign the given documents to the outlier topic.
+        """
+        return self.assign_docs_to_topic(
+            doc_ids,
+            self.OUTLIER_ID,
+            set_validation=set_validation,
+        )
 
     @undoable
     def validate_doc(self, doc_id: int) -> Tuple[Dict, Dict, str]:
