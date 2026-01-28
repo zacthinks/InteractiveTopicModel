@@ -4,10 +4,10 @@ from typing import Optional, List, Callable, Union
 import textwrap
 import numpy as np
 import pandas as pd
+
+import matplotlib.pyplot as plt
 import plotly.graph_objects as go
 import plotly.express as px
-from scipy.cluster.hierarchy import linkage
-from scipy.spatial.distance import pdist
 from sklearn.metrics.pairwise import cosine_similarity
 
 from interactive_topic_model.components import SentenceTransformerEmbedder
@@ -220,94 +220,52 @@ def visualize_documents_with_search(
 
 
 def visualize_topic_hierarchy(
-    itm: "InteractiveTopicModel",
     *,
-    similarity: str = "harmonic",
-    include_inactive: bool = False,
-    linkagefun: Optional[Callable] = None,
+    linkage_matrix,
+    labels: List[str],
+    title: str = "Topic Hierarchy",
+    orientation: str = "right",
+    figsize_per_leaf: float = 0.35,
     save_path: Optional[str] = None,
-) -> go.Figure:
+):
     """
-    Visualize topic hierarchy as dendrogram.
-    
-    Args:
-        itm: InteractiveTopicModel instance.
-        similarity: Similarity metric ('embedding', 'tfidf', or 'harmonic').
-        include_inactive: Whether to include inactive topics.
-        linkagefun: Optional custom linkage function.
-        save_path: Optional path to save figure.
-        
-    Returns:
-        Plotly figure.
+    Render a dendrogram using matplotlib.
+
+    Parameters
+    ----------
+    linkage_matrix : ndarray
+        SciPy linkage matrix.
+    labels : list[str]
+        Leaf labels.
+    orientation : str
+        'left', 'right', 'top', or 'bottom'.
+    figsize_per_leaf : float
+        Vertical size per leaf (in inches).
     """
-    if ff is None:
-        raise ImportError("plotly.figure_factory required for dendrogram visualization")
-    
-    itm._require_fitted()
-    
-    # Get active topics
-    if include_inactive:
-        topics = [t for t in itm.topics.values() if t.topic_id >= 0]
+    from scipy.cluster.hierarchy import dendrogram
+
+    n = len(labels)
+    height = max(4, figsize_per_leaf * n)
+
+    if orientation in ("left", "right"):
+        figsize = (8, height)
     else:
-        topics = [t for t in itm.topics.values() if t.active and t.topic_id >= 0]
-    
-    if len(topics) < 2:
-        print("Need at least 2 topics for hierarchy visualization")
-        return go.Figure()
-    
-    # Collect topic representations
-    topic_ids = []
-    topic_vectors = []
-    
-    for topic in topics:
-        # Skip topics with no direct documents (parent topics after split)
-        if topic.get_count(include_descendants=False) == 0:
-            continue
-            
-        if similarity == "embedding":
-            vec = topic.get_embedding()
-        elif similarity == "tfidf":
-            vec = topic.get_ctfidf()
-        else:  # harmonic - use embedding for now
-            vec = topic.get_embedding()
-        
-        # Skip if vector is None, empty, or contains NaN
-        if vec is not None and len(vec) > 0 and np.all(np.isfinite(vec)):
-            topic_ids.append(topic.topic_id)
-            topic_vectors.append(vec)
-    
-    if len(topic_vectors) < 2:
-        print("Not enough topic representations available")
-        return go.Figure()
-    
-    # Compute pairwise distances
-    topic_matrix = np.array(topic_vectors)
-    distances = pdist(topic_matrix, metric="cosine")
-    
-    # Perform hierarchical clustering
-    if linkagefun is None:
-        Z = linkage(distances, method="average")
-    else:
-        Z = linkagefun(distances)
-    
-    # Create labels
-    labels = [itm.topics[tid].label for tid in topic_ids]
-    
-    # Create dendrogram
-    fig = ff.create_dendrogram(
-        topic_matrix,
+        figsize = (height, 6)
+
+    fig, ax = plt.subplots(figsize=figsize)
+
+    dendrogram(
+        linkage_matrix,
         labels=labels,
-        orientation='left',
-        linkagefun=lambda x: Z,
+        orientation=orientation,
+        ax=ax,
     )
-    
-    fig.update_layout(
-        title="Topic Hierarchy",
-        xaxis_title="Topics",
-        yaxis_title="Distance",
-    )
-    
+
+    ax.set_title(title)
+
+    plt.tight_layout()
+
     if save_path:
-        fig.write_html(save_path)
-    
-    return fig
+        plt.savefig(save_path, bbox_inches="tight")
+
+    return fig, ax

@@ -1750,74 +1750,289 @@ class InteractiveTopicModel:
     
     @undoable
     def merge_topics(
-        self, topic_ids: List[int], new_label: Optional[str] = None
+        self,
+        topic_ids: List[int],
+        new_label: Optional[str] = None,
     ) -> Tuple[Dict, Dict, str]:
         """
-        Merge multiple topics into one.
-        
-        Args:
-            topic_ids: List of topic IDs to merge.
-            new_label: Optional label for merged topic.
-            
-        Returns:
-            Tuple of (forward_state, backward_state, description).
+        Merge multiple topics into one, with hierarchy rules:
+        - Topics can only be merged if they are siblings (same parent object).
+        - If any merged topics have children, those children are reparented to the new merged topic.
+        - Only documents assigned directly to the merged topics (exclude descendants) are moved.
         """
         self._require_fitted()
-        
+
+        # normalize + validate ids
+        topic_ids = [int(t) for t in topic_ids]
+        topic_ids = [t for t in topic_ids if t in self.topics]
+        topic_ids = sorted(set(topic_ids))
+
         if len(topic_ids) < 2:
-            raise ValueError("Must merge at least 2 topics")
-        
-        # Create new merged topic
+            raise ValueError("Must merge at least 2 existing topics")
+
+        # disallow outlier merges
+        if self.OUTLIER_ID in topic_ids:
+            raise ValueError("Cannot merge the outlier topic")
+
+        # siblings-only constraint 
+        parents = [self.topics[tid].parent for tid in topic_ids]
+        parent0 = parents[0]
+        if any(p is not parent0 for p in parents[1:]):
+            raise ITMError("Can only merge sibling topics (topics must share the same parent).")
+
+        # create merged topic under the shared parent 
         merged_id = self._new_topic_id()
-        self._ensure_topic(merged_id, label=new_label, parent=self)
-        
-        # Collect old assignments
-        old_assignments = {}
-        old_strengths = {}
-        
-        for topic_id in topic_ids:
-            if topic_id not in self.topics:
-                continue
-            
-            topic = self.topics[topic_id]
-            doc_ids = topic.get_doc_ids(include_descendants=False)
-            
+        self._ensure_topic(merged_id, label=new_label, parent=parent0)
+        merged_topic = self.topics[merged_id]
+
+        # capture old state for undo 
+        old_assignments: Dict[int, int] = {}
+
+        # parent-relabel bookkeeping for children reparenting
+        forward_topic_parents: Dict[int, object] = {merged_id: parent0}
+        backward_topic_parents: Dict[int, object] = {}
+
+        # move docs (direct only) + deactivate originals 
+        moved_doc_ids: List[int] = []
+
+        for tid in topic_ids:
+            t = self.topics[tid]
+
+            # move docs assigned *directly* to this topic (exclude descendants)
+            doc_ids = t.get_doc_ids(include_descendants=False)
             for doc_id in doc_ids:
+                doc_id = int(doc_id)
                 pos = self._pos(doc_id)
+
                 old_assignments[doc_id] = int(self._assignments[pos])
-                old_strengths[doc_id] = float(self._strengths[pos])
-                
-                # Reassign to merged topic
-                self._assignments[pos] = merged_id
-                self._strengths[pos] = 1.0  # Reset strength
-            
-            # Deactivate old topic
-            topic.active = False
-        
-        # Invalidate representations for affected topics
-        for topic_id in topic_ids:
-            if topic_id in self.topics:
-                self.topics[topic_id].invalidate_representations()
-        self.topics[merged_id].invalidate_representations()
-        
-        # Prepare undo/redo state
+
+                self._assignments[pos] = int(merged_id)
+                moved_doc_ids.append(doc_id)
+
+            t.active = False
+
+        # reparent any children of merged topics to the new merged topic 
+        # (children are topics whose parent is one of the merged topics)
+        for child in list(self.topics.values()):
+            if not isinstance(child.parent, InteractiveTopic):
+                continue
+            if child.parent.topic_id in topic_ids:
+                backward_topic_parents[child.topic_id] = child.parent
+                child.parent = merged_topic
+                forward_topic_parents[child.topic_id] = merged_topic
+
+        # invalidate representations 
+        for tid in topic_ids:
+            if tid in self.topics:
+                self.topics[tid].invalidate_representations()
+        merged_topic.invalidate_representations()
+
+        # undo/redo payloads 
         forward = {
-            "assignments": {doc_id: merged_id for doc_id in old_assignments.keys()},
-            "strengths": {doc_id: 1.0 for doc_id in old_assignments.keys()},
+            "assignments": {doc_id: merged_id for doc_id in moved_doc_ids},
             "new_topic": merged_id,
             "deactivate_topics": topic_ids,
         }
-        
+        if forward_topic_parents:
+            forward["topic_parents"] = forward_topic_parents
+
         backward = {
             "assignments": old_assignments,
-            "strengths": old_strengths,
             "remove_topic": merged_id,
             "reactivate_topics": topic_ids,
         }
-        
-        description = f"Merged {len(topic_ids)} topics into topic {merged_id}"
-        
-        return forward, backward, description
+        if backward_topic_parents:
+            backward["topic_parents"] = backward_topic_parents
+
+        if new_label is None:
+            # generate label without creating a separate undo step
+            old_label = merged_topic._label
+            merged_topic.auto_label(_disable_tracking=True)
+
+            # include label change in this merge's undo payload
+            forward["topic_labels"] = {merged_id: merged_topic._label}
+            backward["topic_labels"] = {merged_id: old_label}
+
+        description = f"Merged {len(topic_ids)} sibling topics into topic {merged_id}"
+        return forward, backward, description, merged_id
+
+    @undoable
+    def merge_similar_topics(
+        self,
+        threshold: float,
+        *,
+        parent: Optional[Union[int, InteractiveTopic, "InteractiveTopicModel"]] = None,
+        mode: str = "embeddings",
+        include_inactive: bool = True,
+        linkagefun: Optional[Callable] = None,
+        new_label_fn: Optional[Callable[[List[int]], str]] = None,
+    ) -> Tuple[Dict, Dict, str, List[int]]:
+        """
+        Merge sibling clusters under `parent` whose linkage distances are <= threshold.
+
+        Uses one hierarchy computation + one global cut:
+        - if ((X Y) Z) merges at <= threshold, then {X,Y,Z} merges in one shot.
+        """
+        self._require_fitted()
+        if threshold < 0:
+            raise ValueError("threshold must be >= 0")
+
+        # Expect: (linkage_matrix, labels, child_topic_ids)
+        linkage_matrix, labels, child_topic_ids = self.get_topic_hierarchy(parent=parent,
+                                                                           mode=mode,
+                                                                           include_inactive=include_inactive,
+                                                                           linkagefun=linkagefun)
+        child_topic_ids = [int(t) for t in child_topic_ids]
+
+        if len(child_topic_ids) < 2:
+            return {}, {}, "No merge performed (fewer than 2 children).", []
+
+        from scipy.cluster.hierarchy import fcluster
+
+        # One cut at distance threshold
+        cluster_ids = fcluster(linkage_matrix, t=threshold, criterion="distance")
+
+        groups: Dict[int, List[int]] = {}
+        for tid, cid in zip(child_topic_ids, cluster_ids):
+            groups.setdefault(int(cid), []).append(int(tid))
+
+        merge_groups = [sorted(g) for g in groups.values() if len(g) >= 2]
+        if not merge_groups:
+            return {}, {}, "No merge performed (no clusters below threshold).", []
+
+        # compose undo states across multiple merge_topics calls
+        forward_all: Dict[str, Any] = {}
+        backward_all: Dict[str, Any] = {}
+        merged_ids: List[int] = []
+
+        def _merge_state(dst: Dict[str, Any], src: Dict[str, Any]) -> None:
+            """Merge one edit-state dict into another, respecting _apply_edit keys."""
+            for k, v in src.items():
+                if k in ("assignments", "strengths", "validated", "topic_labels", "topic_parents", "topic_btms", "topic_active"):
+                    dst.setdefault(k, {}).update(v)
+                elif k in ("deactivate_topics", "reactivate_topics", "new_topics", "remove_topics", "deleted_topics"):
+                    dst.setdefault(k, []).extend(list(v))
+                elif k == "new_topic":
+                    dst.setdefault("new_topics", []).append(v)
+                elif k == "remove_topic":
+                    dst.setdefault("remove_topics", []).append(v)
+                else:
+                    # Handle new keys here.
+                    dst[k] = v
+
+        # Disable tracking for inner merges; merge_similar_topics is the only undo step.
+        with disable_tracking(self):
+            for group in merge_groups:
+                label = new_label_fn(group) if new_label_fn else None
+
+                fwd, bwd, _desc, merged_id = self.merge_topics(group, new_label=label, _disable_tracking=True)
+                merged_ids.append(int(merged_id))
+
+                _merge_state(forward_all, fwd)
+                _merge_state(backward_all, bwd)
+
+        # Clean up duplicates / make deterministic
+        if "new_topics" in forward_all:
+            forward_all["new_topics"] = sorted(set(forward_all["new_topics"]))
+        if "remove_topics" in backward_all:
+            backward_all["remove_topics"] = sorted(set(backward_all["remove_topics"]))
+        if "deactivate_topics" in forward_all:
+            forward_all["deactivate_topics"] = sorted(set(forward_all["deactivate_topics"]))
+        if "reactivate_topics" in backward_all:
+            backward_all["reactivate_topics"] = sorted(set(backward_all["reactivate_topics"]))
+
+        desc = (
+            f"Merged {sum(len(g) for g in merge_groups)} topics across {len(merge_groups)} clusters "
+            f"under parent {getattr(parent, 'topic_id', 'ITM')} (threshold={threshold})."
+        )
+        print(desc)
+
+        return forward_all, backward_all, desc, merged_ids
+
+    @undoable
+    def merge_topics_by_label(
+        self,
+        exclude_inactive: bool = True,
+    ) -> Tuple[Dict, Dict, str, List[int]]:
+        """
+        Merge topics that share the same label, but only when they are siblings.
+
+        Args:
+            exclude_inactive: If True, skip inactive topics.
+
+        Returns:
+            (forward_state, backward_state, description, merged_topic_ids)
+        """
+        self._require_fitted()
+
+        # Group by (parent_object, label) so merges are always sibling-safe.
+        groups: Dict[Tuple[object, str], List[int]] = {}
+
+        for tid, topic in self.topics.items():
+            if tid == self.OUTLIER_ID:
+                continue
+            if exclude_inactive and not topic.active:
+                continue
+            if not topic._label:
+                continue
+
+            key = (topic.parent, topic._label)
+            groups.setdefault(key, []).append(int(tid))
+
+        merge_groups: List[Tuple[object, str, List[int]]] = []
+        for (parent_obj, label), tids in groups.items():
+            tids = sorted(set(int(t) for t in tids if t in self.topics))
+            if len(tids) >= 2:
+                merge_groups.append((parent_obj, label, tids))
+
+        if not merge_groups:
+            return {}, {}, "No topics with duplicate labels found (among siblings).", []
+
+        # Compose undo/redo states across multiple merge_topics calls (same as merge_similar_topics).
+        forward_all: Dict[str, Any] = {}
+        backward_all: Dict[str, Any] = {}
+        merged_ids: List[int] = []
+
+        def _merge_state(dst: Dict[str, Any], src: Dict[str, Any]) -> None:
+            """Merge one edit-state dict into another, respecting _apply_edit keys."""
+            for k, v in src.items():
+                if k in ("assignments", "strengths", "validated", "topic_labels", "topic_parents", "topic_btms", "topic_active"):
+                    dst.setdefault(k, {}).update(v)
+                elif k in ("deactivate_topics", "reactivate_topics", "new_topics", "remove_topics", "deleted_topics"):
+                    dst.setdefault(k, []).extend(list(v))
+                elif k == "new_topic":
+                    dst.setdefault("new_topics", []).append(v)
+                elif k == "remove_topic":
+                    dst.setdefault("remove_topics", []).append(v)
+                else:
+                    dst[k] = v
+
+        # Disable tracking for inner merges; merge_topics_by_label is the only undo step.
+        with disable_tracking(self):
+            for _parent_obj, label, tids in merge_groups:
+                # merge_topics enforces siblings-only itself, but grouping by parent prevents failures up front.
+                fwd, bwd, _desc, merged_id = self.merge_topics(
+                    tids,
+                    new_label=label,
+                    _disable_tracking=True,
+                )
+                merged_ids.append(int(merged_id))
+                _merge_state(forward_all, fwd)
+                _merge_state(backward_all, bwd)
+
+        # Clean up duplicates / determinism
+        if "new_topics" in forward_all:
+            forward_all["new_topics"] = sorted(set(forward_all["new_topics"]))
+        if "remove_topics" in backward_all:
+            backward_all["remove_topics"] = sorted(set(backward_all["remove_topics"]))
+        if "deactivate_topics" in forward_all:
+            forward_all["deactivate_topics"] = sorted(set(forward_all["deactivate_topics"]))
+        if "reactivate_topics" in backward_all:
+            backward_all["reactivate_topics"] = sorted(set(backward_all["reactivate_topics"]))
+
+        merged_count = sum(len(tids) for _, _, tids in merge_groups)
+        desc = f"Merged {merged_count} topics across {len(merge_groups)} sibling-label groups."
+        return forward_all, backward_all, desc, merged_ids
 
     @undoable
     def create_topic(
@@ -2052,6 +2267,98 @@ class InteractiveTopicModel:
         
         return result
     
+    def get_topic_hierarchy(
+        self,
+        *,
+        parent: Optional[Union[int, "InteractiveTopic", "InteractiveTopicModel"]] = None,
+        mode: str = "embeddings",
+        include_inactive: bool = True,
+        linkagefun: Optional[Callable] = None,
+    ) -> Tuple[np.ndarray, List[str], np.ndarray, List[int]]:
+        """
+        Compute pairwise hierarchical clustering among the children of `parent`.
+
+        Args:
+            parent: Parent topic ID or object (None = root ITM).
+            mode: Representation mode ("embeddings" or "ctfidf").
+            include_inactive: Whether to include inactive topics.
+            linkagefun: Optional custom linkage function.
+
+        Returns
+        -------
+        linkage_matrix : ndarray (n-1, 4)
+            SciPy linkage matrix.
+        labels : list[str]
+            Topic labels in leaf order.
+        topic_ids : list[int]
+            Topic IDs corresponding to labels.
+        """
+        from scipy.cluster.hierarchy import linkage
+        from scipy.spatial.distance import pdist
+
+        self._require_fitted()
+
+        # Resolve parent object
+        if parent is None:
+            parent_obj = self
+        elif isinstance(parent, int):
+            if parent not in self.topics:
+                raise ITMError(f"Unknown parent topic_id: {parent}")
+            parent_obj = self.topics[parent]
+        else:
+            parent_obj = parent
+
+        # Collect children of parent
+        topics = [
+            t for t in self.topics.values()
+            if t.topic_id >= 0
+            and getattr(t, "parent", None) is parent_obj
+            and (include_inactive or t.active)
+            and t.get_count(include_descendants=True) > 0
+        ]
+
+        if len(topics) < 2:
+            raise ITMError("Need at least two child topics to build a hierarchy.")
+
+        # Build representations
+        vectors = []
+        labels = []
+        topic_ids = []
+
+        for t in topics:
+            if mode == "embeddings":
+                vec = t.get_embedding()
+            elif mode == "ctfidf":
+                vec = t.get_ctfidf()
+            else:
+                raise ValueError(f"Unknown mode: {mode}")
+
+            if vec is None:
+                continue
+
+            if not np.all(np.isfinite(vec)):
+                print(f"Skipping topic {t.topic_id} due to non-finite vector.")
+                continue
+
+            # Must be non-zero norm for cosine distance
+            if np.linalg.norm(vec) == 0.0:
+                print(f"Skipping topic {t.topic_id} due to zero vector.")
+                continue
+
+            vectors.append(vec)
+            labels.append(t.label)
+            topic_ids.append(t.topic_id)
+
+        topic_matrix = np.vstack(vectors)
+        distances = pdist(topic_matrix, metric="cosine")
+
+        if linkagefun is None:
+            linkage_matrix = linkage(distances, method="single", optimal_ordering=True)
+        else:
+            linkage_matrix = linkagefun(distances)
+
+        return linkage_matrix, labels, topic_ids
+    
     def get_active_topics(self) -> List[int]:
         """Get list of active topic IDs."""
         return [tid for tid, t in self.topics.items() if t.active and tid >= 0]
@@ -2258,98 +2565,6 @@ class InteractiveTopicModel:
             "topic_parents": old_parents,
         }
         description = f"Grouped {len(topic_ids)} topics under parent {parent_id}"
-        
-        return forward, backward, description
-    
-    @undoable
-    def merge_topics_by_label(
-        self, exclude_inactive: bool = True, into: str = "first"
-    ) -> Tuple[Dict, Dict, str]:
-        """
-        Merge topics that share the same label.
-        
-        Args:
-            exclude_inactive: Skip inactive topics.
-            into: "first" keeps the first topic ID, "lowest" keeps the lowest ID.
-            
-        Returns:
-            Tuple of (forward_state, backward_state, description).
-        """
-        # Group topics by label
-        label_to_tids: Dict[str, List[int]] = {}
-        for tid, topic in self.topics.items():
-            if tid == self.OUTLIER_ID:
-                continue
-            if exclude_inactive and not topic.active:
-                continue
-            if not topic._label:
-                continue
-            label_to_tids.setdefault(topic._label, []).append(tid)
-        
-        # Collect all merges
-        all_old_assignments = {}
-        all_old_strengths = {}
-        merged_count = 0
-        
-        with disable_tracking(self):
-            for label, tids in label_to_tids.items():
-                if len(tids) < 2:
-                    continue
-                
-                # Choose which topic to keep
-                if into == "first":
-                    keep_id = tids[0]
-                elif into == "lowest":
-                    keep_id = min(tids)
-                else:
-                    raise ValueError(f"Unknown 'into' mode: {into}")
-                
-                merge_ids = [t for t in tids if t != keep_id]
-                
-                # Collect old assignments
-                for merge_id in merge_ids:
-                    topic = self.topics[merge_id]
-                    doc_ids = topic.get_doc_ids(include_descendants=False)
-                    
-                    for doc_id in doc_ids:
-                        pos = self._pos(doc_id)
-                        all_old_assignments[doc_id] = int(self._assignments[pos])
-                        all_old_strengths[doc_id] = float(self._strengths[pos])
-                        
-                        # Reassign to keep_id
-                        self._assignments[pos] = keep_id
-                        self._strengths[pos] = 1.0
-                    
-                    # Deactivate merged topic
-                    topic.active = False
-                
-                merged_count += len(merge_ids)
-        
-        if merged_count == 0:
-            # No merges performed - return empty state
-            return {}, {}, "No topics with duplicate labels found"
-        
-        # Invalidate affected topics
-        affected = set()
-        for doc_id in all_old_assignments.keys():
-            pos = self._pos(doc_id)
-            affected.add(int(self._assignments[pos]))
-            affected.add(all_old_assignments[doc_id])
-        
-        for tid in affected:
-            if tid in self.topics:
-                self.topics[tid].invalidate_representations()
-        
-        forward = {
-            "assignments": {doc_id: int(self._assignments[self._pos(doc_id)]) 
-                          for doc_id in all_old_assignments.keys()},
-            "strengths": {doc_id: 1.0 for doc_id in all_old_assignments.keys()},
-        }
-        backward = {
-            "assignments": all_old_assignments,
-            "strengths": all_old_strengths,
-        }
-        description = f"Merged {merged_count} topics by label"
         
         return forward, backward, description
     
@@ -2608,33 +2823,32 @@ class InteractiveTopicModel:
             search_embedder=search_embedder,
             save_path=save_path,
         )
-    
-    def visualize_hierarchy(
+
+    def visualize_topic_hierarchy(
         self,
         *,
-        similarity: str = "harmonic",
-        include_inactive: bool = False,
+        parent=None,
+        mode: str = "embeddings",
+        include_inactive: bool = True,
         linkagefun: Optional[Callable] = None,
+        orientation: str = "right",
+        title: str = "Topic Hierarchy",
         save_path: Optional[str] = None,
     ):
-        """
-        Visualize topic hierarchy as dendrogram.
-        
-        Args:
-            similarity: Similarity metric ('embedding', 'tfidf', or 'harmonic').
-            include_inactive: Whether to include inactive topics.
-            linkagefun: Optional custom linkage function.
-            save_path: Optional path to save figure.
-            
-        Returns:
-            Plotly figure.
-        """
-        from .visualization import visualize_topic_hierarchy as _visualize_hierarchy
-        return _visualize_hierarchy(
-            self,
-            similarity=similarity,
+        linkage_matrix, labels, _ = self.get_topic_hierarchy(
+            parent=parent,
+            mode=mode,
             include_inactive=include_inactive,
             linkagefun=linkagefun,
+        )
+
+        from interactive_topic_model.visualization import visualize_topic_hierarchy as viz
+
+        return viz(
+            linkage_matrix=linkage_matrix,
+            labels=labels,
+            orientation=orientation,
+            title=title,
             save_path=save_path,
         )
 
