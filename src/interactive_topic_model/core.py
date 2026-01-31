@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 from scipy import sparse
 from sklearn.feature_extraction.text import CountVectorizer, TfidfTransformer
+from sklearn.neighbors import NearestNeighbors
 from sklearn.metrics.pairwise import cosine_similarity
 
 from .protocols import Embedder, Reducer, Clusterer, Scorer
@@ -123,6 +124,13 @@ class BasicTopicModel:
         scorer: Optional[Scorer] = None,
         vectorizer: Optional[CountVectorizer] = None,
         n_representative_docs: int = 3,
+        knn_cache_k: int = 150,
+        knn_vote_k: int = 50,
+        compute_knn_cache: bool = True,
+        # Neighbor-vote + distance-penalty defaults
+        neighbor_vote_k_min: int = 5,
+        neighbor_close_m: int = 5,
+        neighbor_penalty_lambda: float = 0.3,
     ):
         """
         Initialize BasicTopicModel.
@@ -175,6 +183,20 @@ class BasicTopicModel:
         # Lexical (DTM) caches for this semantic space (only used when this BTM has a custom vectorizer)
         self._dtm: Optional[sparse.csr_matrix] = None  # rows align to _lex_doc_id_to_pos
         self._vocabulary: Optional[List[str]] = None
+        # Positional reverse mapping (kept in sync with _doc_id_to_pos)
+        self._pos_to_doc_id: List[int] = []
+
+        # Optional cached kNN graph in the ORIGINAL embedding space (cosine similarity).
+        # Stores neighbor positions (NOT doc_ids) so it stays stable under label changes.
+        self._knn_cache_k: int = int(knn_cache_k)
+        self._knn_vote_k: int = int(knn_vote_k)
+        self._neighbor_vote_k_min: int = int(neighbor_vote_k_min)
+        self._neighbor_close_m: int = int(neighbor_close_m)
+        self._neighbor_penalty_lambda: float = float(neighbor_penalty_lambda)
+        self._compute_knn_cache: bool = bool(compute_knn_cache)
+        self._knn_indices: Optional[np.ndarray] = None  # shape (N, k), int32
+        self._knn_sims: Optional[np.ndarray] = None     # shape (N, k), float32
+
         
     
     def fit(self, doc_ids: List[int]) -> Dict[str, Any]:
@@ -191,9 +213,14 @@ class BasicTopicModel:
         
         # Build doc_id mapping
         self._doc_id_to_pos = {doc_id: i for i, doc_id in enumerate(doc_ids)}
+        self._pos_to_doc_id = list(doc_ids)
         
         # Generate embeddings
         self._embeddings = self.embedder.encode(texts)
+
+        # Optionally build cached kNN graph in embedding space (cosine similarity)
+        if self._compute_knn_cache and self._knn_cache_k > 0:
+            self._build_knn_cache()
         
         # Reduce dimensionality
         self._reduced_embeddings = self.reducer.fit_transform(self._embeddings)
@@ -275,6 +302,135 @@ class BasicTopicModel:
         base = len(self._doc_id_to_pos)
         for i, doc_id in enumerate(missing):
             self._doc_id_to_pos[doc_id] = base + i
+            self._pos_to_doc_id.append(doc_id)
+
+        # Optionally update kNN cache for the newly appended rows (does not retroactively update older rows)
+        if self._compute_knn_cache and self._knn_cache_k > 0:
+            self._update_knn_for_new_rows(start_pos=base, n_new=len(missing))
+
+    # ----------------------------
+    # Cached kNN graph utilities
+    # ----------------------------
+
+    def _build_knn_cache(self) -> None:
+        """Build a full kNN cache for all docs currently in this semantic space.
+
+        Uses cosine distance in the ORIGINAL embedding space (not reduced space).
+        Stores neighbor *positions* (row indices) and cosine similarities.
+        """
+        if self._embeddings is None or self._embeddings.size == 0:
+            self._knn_indices = None
+            self._knn_sims = None
+            return
+
+        k = int(self._knn_cache_k)
+        n = int(self._embeddings.shape[0])
+        if k <= 0 or n <= 1:
+            self._knn_indices = np.zeros((n, 0), dtype=np.int32)
+            self._knn_sims = np.zeros((n, 0), dtype=np.float32)
+            return
+
+        # sklearn returns cosine *distances* in [0, 2] (for non-normalized); we store cosine similarities.
+        nn = NearestNeighbors(n_neighbors=min(k + 1, n), metric="cosine", algorithm="brute")
+        nn.fit(self._embeddings)
+        distances, indices = nn.kneighbors(self._embeddings, return_distance=True)
+
+        # drop self-neighbor (distance 0) when present
+        if indices.shape[1] > k:
+            indices = indices[:, 1:]
+            distances = distances[:, 1:]
+
+        sims = (1.0 - distances).astype(np.float32)
+        self._knn_indices = indices.astype(np.int32, copy=False)
+        self._knn_sims = sims
+
+    def _update_knn_for_new_rows(self, *, start_pos: int, n_new: int) -> None:
+        """Append kNN rows for newly added docs.
+
+        This updates ONLY the rows for new docs. Older rows remain unchanged (asymmetric kNN graph),
+        which is usually fine when additions are rare.
+        """
+        if n_new <= 0:
+            return
+        if self._embeddings is None or self._embeddings.size == 0:
+            return
+
+        # If cache doesn't exist yet, just build it from scratch.
+        if self._knn_indices is None or self._knn_sims is None:
+            self._build_knn_cache()
+            return
+
+        k = int(self._knn_cache_k)
+        n = int(self._embeddings.shape[0])
+        if k <= 0 or n <= 1:
+            return
+
+        new_emb = self._embeddings[start_pos:start_pos + n_new]
+        nn = NearestNeighbors(n_neighbors=min(k + 1, n), metric="cosine", algorithm="brute")
+        nn.fit(self._embeddings)
+        distances, indices = nn.kneighbors(new_emb, return_distance=True)
+
+        # remove self neighbor if present (only guaranteed when querying the same rows)
+        # We'll drop any neighbor equal to its own position, then take top-k remaining.
+        cleaned_idx = []
+        cleaned_sim = []
+        for row_i in range(indices.shape[0]):
+            pos = start_pos + row_i
+            idx_row = indices[row_i].tolist()
+            dist_row = distances[row_i].tolist()
+            pairs = [(j, d) for j, d in zip(idx_row, dist_row) if j != pos]
+            pairs = pairs[:k]
+            cleaned_idx.append([p[0] for p in pairs] + [0] * max(0, k - len(pairs)))
+            cleaned_sim.append([(1.0 - p[1]) for p in pairs] + [0.0] * max(0, k - len(pairs)))
+
+        new_idx = np.asarray(cleaned_idx, dtype=np.int32)
+        new_sim = np.asarray(cleaned_sim, dtype=np.float32)
+
+        # Append
+        self._knn_indices = np.vstack([self._knn_indices, new_idx])
+        self._knn_sims = np.vstack([self._knn_sims, new_sim])
+
+    def get_knn(
+        self,
+        doc_id: int,
+        *,
+        k: Optional[int] = None,
+        include_self: bool = False,
+    ) -> Tuple[List[int], np.ndarray]:
+        """Return cached kNN for a doc_id as (neighbor_doc_ids, neighbor_sims)."""
+        if doc_id not in self._doc_id_to_pos:
+            self.add_docs_to_space([doc_id])
+
+        pos = self._doc_id_to_pos[doc_id]
+        if self._knn_indices is None or self._knn_sims is None:
+            if self._compute_knn_cache and self._knn_cache_k > 0:
+                self._build_knn_cache()
+            else:
+                return [], np.zeros((0,), dtype=np.float32)
+
+        if self._knn_indices is None or self._knn_sims is None:
+            return [], np.zeros((0,), dtype=np.float32)
+
+        row_idx = self._knn_indices[pos]
+        row_sim = self._knn_sims[pos]
+        kk = int(k) if k is not None else row_idx.shape[0]
+        kk = max(0, min(kk, row_idx.shape[0]))
+
+        neigh_pos = row_idx[:kk].tolist()
+        neigh_sim = row_sim[:kk].copy()
+
+        neigh_doc_ids = []
+        for p in neigh_pos:
+            if p < 0 or p >= len(self._pos_to_doc_id):
+                continue
+            d = self._pos_to_doc_id[p]
+            if not include_self and d == doc_id:
+                continue
+            neigh_doc_ids.append(d)
+
+        # Trim sims to match doc_ids length (in case we dropped invalids)
+        neigh_sim = neigh_sim[:len(neigh_doc_ids)]
+        return neigh_doc_ids, neigh_sim
 
     def get_embeddings(self, doc_ids: Iterable[int]) -> Tuple[np.ndarray, np.ndarray]:
         doc_ids = list(doc_ids)
@@ -404,7 +560,12 @@ class InteractiveTopic:
         self._label = label
         self.parent = parent if parent is not None else itm
         self.active = True
-        
+
+        # Cached within-topic closeness stats for neighbor-distance penalty.
+        # Tuple: (m_close, mu, sigma) where mu is median of per-doc local mean similarities
+        # and sigma is a robust spread estimate (scaled MAD). Invalidated when memberships change.
+        self._closeness_stats: Optional[Tuple[int, float, float]] = None
+
         # Hierarchical split support
         self.btm: Optional[BasicTopicModel] = None  # Set if this topic has its own semantic space
         self._split_preview: Optional[SplitPreview] = None
@@ -523,6 +684,7 @@ class InteractiveTopic:
         self,
         n: int = 10,
         include_descendants: bool = True,
+        remove_duplicates: bool = True,
         random_state: Optional[int] = None,
     ) -> List[str]:
         """
@@ -531,12 +693,16 @@ class InteractiveTopic:
         Args:
             n: Number of examples to return.
             include_descendants: Whether to include descendant topics.
+            remove_duplicates: Whether to remove duplicate texts.
             random_state: Random seed for sampling.
             
         Returns:
             List of example document texts.
         """
         texts = self.get_texts(include_descendants=include_descendants)
+        
+        if remove_duplicates:
+            texts = list(set(texts))
         
         if len(texts) <= n:
             return texts
@@ -819,6 +985,69 @@ class InteractiveTopic:
         self._cached_ctfidf = None
         self._cached_top_terms = None
         self._cached_representative_doc_ids = None
+        self._closeness_stats = None
+
+    def _get_closeness_stats(self, *, m_close: int) -> Tuple[float, float]:
+        """
+        Return (mu, sigma) for within-topic local closeness, used for the distance penalty.
+
+        - For each doc in this topic, compute the mean cosine similarity to its top `m_close`
+          nearest neighbors *that are also in this topic* (using the semantic space's cached kNN).
+        - mu is the median of those per-doc means.
+        - sigma is a robust spread estimate using scaled MAD: 1.4826 * median(|x - mu|).
+
+        Cached as a single triple (m_close, mu, sigma) and invalidated when assignments change.
+        """
+        m_close = int(m_close)
+        if self._closeness_stats is not None:
+            cached_m, mu, sigma = self._closeness_stats
+            if int(cached_m) == m_close:
+                return float(mu), float(sigma)
+
+        btm = self.semantic_space
+        doc_ids = [int(d) for d in self.get_doc_ids(include_descendants=True)]
+        if len(doc_ids) <= 1:
+            mu, sigma = (0.0, 1e-6)
+            self._closeness_stats = (m_close, float(mu), float(sigma))
+            return float(mu), float(sigma)
+
+        doc_set = set(doc_ids)
+        # Scan enough neighbors to find `m_close` in-topic neighbors even when a topic is sparse.
+        cache_k = int(getattr(btm, "_knn_cache_k", max(50, m_close * 10)))
+        scan_k = min(cache_k, max(50, m_close * 10))
+
+        vals: List[float] = []
+        for d in doc_ids:
+            neigh_ids, neigh_sims = btm.get_knn(d, k=scan_k, include_self=False)
+            sims: List[float] = []
+            for nid, sim in zip(neigh_ids, neigh_sims):
+                if nid is None:
+                    continue
+                nid = int(nid)
+                if nid not in doc_set:
+                    continue
+                w = float(sim)
+                if w <= 0.0:
+                    continue
+                sims.append(w)
+                if len(sims) >= m_close:
+                    break
+            if sims:
+                vals.append(float(np.mean(sims)))
+
+        if not vals:
+            mu, sigma = (0.0, 1e-6)
+        else:
+            arr = np.asarray(vals, dtype=float)
+            mu = float(np.median(arr))
+            mad = float(np.median(np.abs(arr - mu)))
+            sigma = float(1.4826 * mad)
+            if sigma <= 1e-12:
+                sigma = 1e-6
+
+        self._closeness_stats = (m_close, float(mu), float(sigma))
+        return float(mu), float(sigma)
+
     
     @undoable
     def auto_label(self, n: int = 4) -> Tuple[Dict, Dict, str]:
@@ -850,6 +1079,9 @@ class InteractiveTopic:
         reducer: Optional[Reducer] = None,
         clusterer: Optional[Clusterer] = None,
         vectorizer: Optional[CountVectorizer] = None,
+        knn_cache_k: Optional[int] = None,
+        knn_vote_k: Optional[int] = None,
+        compute_knn_cache: Optional[bool] = None,
     ) -> Optional[pd.DataFrame]:
         """
         Preview a split of this topic.
@@ -882,6 +1114,11 @@ class InteractiveTopic:
 
         if embedder is not None:
             # New semantic space for this (would-be) split parent topic.
+            # Inherit kNN defaults from the ITM unless explicitly overridden.
+            _knn_cache_k = self.itm.knn_cache_k if knn_cache_k is None else int(knn_cache_k)
+            _knn_vote_k = self.itm.knn_vote_k if knn_vote_k is None else int(knn_vote_k)
+            _compute_knn = self.itm.compute_knn_cache if compute_knn_cache is None else bool(compute_knn_cache)
+
             split_btm = BasicTopicModel(
                 itm=self.itm,
                 embedder=embedder,
@@ -890,6 +1127,9 @@ class InteractiveTopic:
                 scorer=self.itm.btm.scorer,
                 vectorizer=vectorizer,
                 n_representative_docs=self.itm.btm.n_representative_docs,
+                knn_cache_k=_knn_cache_k,
+                knn_vote_k=_knn_vote_k,
+                compute_knn_cache=_compute_knn,
             )
             fit_out = split_btm.fit(doc_ids)
             labels = fit_out["labels"]
@@ -1316,6 +1556,10 @@ class InteractiveTopicModel:
         clusterer: Optional[Clusterer] = None,
         scorer: Optional[Scorer] = None,
         n_representative_docs: int = 3,
+        # kNN cache / voting defaults (used by BTMs created by this ITM)
+        knn_cache_k: int = 150,
+        knn_vote_k: int = 50,
+        compute_knn_cache: bool = True,
     ):
         """
         Initialize Interactive Topic Model.
@@ -1352,6 +1596,11 @@ class InteractiveTopicModel:
         
         self._default_vectorizer = vectorizer or default_vectorizer()
 
+        # Store kNN defaults so child semantic spaces can inherit them
+        self.knn_cache_k = int(knn_cache_k)
+        self.knn_vote_k = int(knn_vote_k)
+        self.compute_knn_cache = bool(compute_knn_cache)
+
         # Create root BTM (semantic space)
         self.btm = BasicTopicModel(
             itm=self,
@@ -1361,6 +1610,9 @@ class InteractiveTopicModel:
             scorer=scorer,
             vectorizer=self._default_vectorizer,
             n_representative_docs=n_representative_docs,
+            knn_cache_k=self.knn_cache_k,
+            knn_vote_k=self.knn_vote_k,
+            compute_knn_cache=self.compute_knn_cache,
         )
         
         self._fitted = False
@@ -1480,12 +1732,15 @@ class InteractiveTopicModel:
                 frontier.append(t)
         return frontier
     
-    def assignment_candidates(self, space_btm, *, prefer_frontier: bool = True):
-        topics = self.topics_in_semantic_space(space_btm)
-        if not prefer_frontier:
-            return topics
-        frontier = self.frontier_topics_in_space(space_btm)
-        return frontier if frontier else topics
+    def assignment_candidates(self, space_btm, *, prefer_frontier: bool = True, exclude_empty: bool = True) -> List["InteractiveTopic"]:
+        if prefer_frontier:
+            topics = self.frontier_topics_in_space(space_btm)
+        else:
+            topics = self.topics_in_semantic_space(space_btm)
+        if exclude_empty:
+            topics = [t for t in topics if t.get_count() > 0]
+        
+        return topics
 
     # ----------------------------
     # Fit operation
@@ -1766,13 +2021,11 @@ class InteractiveTopicModel:
         self,
         doc_id: int,
         *,
-        mode: Optional[Union[str, Callable]] = None,
-        threshold: float = 0.0,
-    ) -> Tuple[Optional[int], float]:
+        mode: Optional[Union[str, Callable]] = "neighbors",
+        neighbor_k: Optional[int] = None,
+    ) -> Tuple[Optional[int], Tuple[float, float]]:
         """
         Suggest best LEAF topic for a document, respecting semantic spaces.
-
-        Threshold is applied ONLY at the end (on the final leaf score).
         """
         self._require_fitted()
 
@@ -1786,12 +2039,20 @@ class InteractiveTopicModel:
             doc_tfidf = None
 
         # Determine scorer
-        if mode is None or mode == "embedding":
+        # Backwards compatibility: treat mode=None as the default.
+        if mode is None:
+            mode = "neighbors"
+
+        use_neighbors = False
+        if mode == "embedding":
             scorer = embedding_scorer
         elif mode == "tfidf":
             scorer = tfidf_scorer
         elif mode == "harmonic":
             scorer = harmonic_scorer
+        elif mode == "neighbors":
+            scorer = None
+            use_neighbors = True
         elif callable(mode):
             scorer = mode
         else:
@@ -1801,94 +2062,229 @@ class InteractiveTopicModel:
         space_btm = self.btm  # start at root semantic space
         best_leaf_id: Optional[int] = None
         best_leaf_score: float = 0.0
+        best_leaf_support: float = 1.0
 
         while True:
             candidates = self.assignment_candidates(space_btm, prefer_frontier=True)
             if not candidates:
                 break
+            support: float = 1.0
+            topic_ids: List[int] = [t.topic_id for t in candidates]            # Neighbor-vote parameters
+            if use_neighbors:
+                # kVote is chosen to avoid overweighting large topics:
+                #   kVote = clamp(min_topic_size_among_candidates, kVoteMin, kVoteMax)
+                k_vote_max = int(neighbor_k) if neighbor_k is not None else int(getattr(space_btm, "_knn_vote_k", 50))
+                k_vote_min = int(getattr(self, "_neighbor_vote_k_min", 5))
+                min_size = min(int(t.get_count()) for t in candidates) if candidates else 0
+                vote_k = max(k_vote_min, min(min_size, k_vote_max))
 
-            # IMPORTANT: embed the doc in the CURRENT semantic space, not root
-            doc_emb, _ = space_btm.get_embeddings([doc_id])
-            doc_embedding = doc_emb[0] if doc_emb.size else None
+                cache_k = int(getattr(space_btm, "_knn_cache_k", vote_k))
+                # Scan more than we vote with so we can skip inactive neighbors.
+                neighbor_scan_k = min(cache_k, max(50, vote_k * 3))
+            else:
+                vote_k = 0
+                neighbor_scan_k = 0
+            if use_neighbors:
+                # Neighbor-vote scoring: weighted vote among nearest-neighbor *documents*.
+                # We condition on the current semantic space by ignoring neighbors whose current
+                # assignment cannot be lifted into this space.
+                neigh_doc_ids, neigh_sims = space_btm.get_knn(doc_id, k=neighbor_scan_k)
+                candidate_set = set(int(tid) for tid in topic_ids)
 
-            topic_ids = []
-            topic_embs = []
-            topic_cts = []
-            for t in candidates:
-                topic_ids.append(t.topic_id)
-                topic_embs.append(t.get_embedding())
-                topic_cts.append(t.get_ctfidf())
+                scores_map: Dict[int, float] = {int(tid): 0.0 for tid in topic_ids}
+                counts_map: Dict[int, int] = {int(tid): 0 for tid in topic_ids}
 
-            topic_embeddings = np.asarray(topic_embs)
-            topic_ctfidfs = np.asarray(topic_cts) if topic_cts else None
+                # Track per-topic nearest similarities for the distance penalty
+                m_close = int(getattr(self, "_neighbor_close_m", 5))
+                topic_sims: Dict[int, List[float]] = {int(tid): [] for tid in topic_ids}
 
-            scores = scorer(doc_embedding, doc_tfidf, topic_embeddings, topic_ctfidfs)
+                total_w_in = 0.0     # weight that contributes to candidates in this semantic space
+                total_w_all = 0.0    # weight examined (positive similarities), regardless of space
+
+                for nd, sim in zip(neigh_doc_ids, neigh_sims):
+                    if nd is None:
+                        continue
+                    w = float(sim)
+                    if w <= 0.0:
+                        continue
+
+                    total_w_all += w
+
+                    assigned = int(self._assignments[self._pos(int(nd))])
+                    if assigned < 0 or assigned not in self.topics:
+                        continue
+
+                    # Lift neighbor assignment up until we're in this semantic space.
+                    tcur = self.topics[assigned]
+                    while tcur.semantic_space is not space_btm:
+                        if not isinstance(tcur.parent, InteractiveTopic):
+                            tcur = None
+                            break
+                        tcur = tcur.parent
+                    if tcur is None:
+                        continue
+
+                    # If assigned topic isn't a candidate (e.g., container), climb within this space.
+                    while tcur.topic_id not in candidate_set:
+                        if not isinstance(tcur.parent, InteractiveTopic):
+                            break
+                        if tcur.parent.semantic_space is not space_btm:
+                            break
+                        tcur = tcur.parent
+                    if tcur.topic_id not in candidate_set:
+                        continue
+
+                    tid = int(tcur.topic_id)
+
+                    # Per-topic cap: each candidate can contribute at most vote_k neighbors.
+                    if counts_map[tid] >= vote_k:
+                        continue
+
+                    scores_map[tid] += w
+                    total_w_in += w
+                    counts_map[tid] += 1
+
+                    if len(topic_sims[tid]) < m_close:
+                        topic_sims[tid].append(w)
+
+                    # Early stop: once all topics hit the per-topic cap.
+                    if all(v >= vote_k for v in counts_map.values()):
+                        break
+
+                if total_w_in > 0:
+                    raw_scores = np.asarray([scores_map[int(tid)] / total_w_in for tid in topic_ids], dtype=float)
+                else:
+                    raw_scores = np.zeros((len(topic_ids),), dtype=float)
+
+                # Distance penalty: down-weight topics where the doc is atypically far from members.
+                penalized_scores = raw_scores.copy()
+                lambda_ = float(getattr(self, "_neighbor_penalty_lambda", 0.3))
+
+                for i, tid in enumerate(topic_ids):
+                    sims = topic_sims[int(tid)]
+                    s_topic = float(np.mean(sims)) if sims else 0.0
+
+                    topic_obj = self.topics[int(tid)]
+                    mu, sigma = topic_obj._get_closeness_stats(m_close=m_close)
+
+                    # z = how many robust "sigmas" below typical closeness we are
+                    z = (mu - s_topic) / sigma if sigma > 0 else 0.0
+                    if z > 0:
+                        penalized_scores[i] = raw_scores[i] * float(np.exp(-lambda_ * z))
+
+                scores = penalized_scores
+                support = float(total_w_in / total_w_all) if total_w_all > 0 else 0.0
+
+            else:
+                # Embedding / lexical scoring against topic representations
+                # IMPORTANT: embed the doc in the CURRENT semantic space, not root
+                doc_emb, _ = space_btm.get_embeddings([doc_id])
+                doc_embedding = doc_emb[0] if doc_emb.size else None
+
+                topic_embs = [t.get_embedding() for t in candidates]
+                topic_cts = [t.get_ctfidf() for t in candidates]
+
+                topic_embeddings = np.asarray(topic_embs)
+                topic_ctfidfs = np.asarray(topic_cts) if topic_cts else None
+
+                scores = scorer(doc_embedding, doc_tfidf, topic_embeddings, topic_ctfidfs)
+
             best_idx = int(np.argmax(scores))
             best_id = int(topic_ids[best_idx])
             best_score = float(scores[best_idx])
 
             best_topic = self.topics[best_id]
 
-            # If we can descend, do so (ignore threshold until the end)
+            # If we can descend, do so
             if best_topic.btm is not None:
                 space_btm = best_topic.btm
                 continue
 
             # Otherwise, we've reached a leaf in this descent path
-            best_leaf_id = best_id
             best_leaf_score = best_score
+            if best_leaf_score <= 1e-5:
+                best_leaf_id = None
+            else:
+                best_leaf_id = best_id
+            best_leaf_support = float(support)
             break
 
-        # Apply threshold ONLY at the end
-        if best_leaf_id is None or best_leaf_score < threshold:
-            return None, 0.0
-        return best_leaf_id, best_leaf_score
+        return best_leaf_id, (best_leaf_score, best_leaf_support)
 
     @undoable
-    def refit_docs(
+    def reassign_docs(
         self,
-        doc_ids: Sequence[int],
+        doc_ids: Optional[Sequence[int]]= None,
         *,
-        mode: Optional[Union[str, Any]] = None,
-        threshold: float = 0.0,
-        validate_refits: bool = True,
-        auto_reassign: bool = False,
+        mode: Optional[Union[str, Any]] = "neighbors",
+        neighbor_k: Optional[int] = None,
+        threshold: float = float('+inf'),
+        validate_reassignments: bool = True,
+        ignore_consensus: bool = True,
         export_path: Optional[str] = None,
     ):
+        """
+        Suggest and optionally reassign documents to best-fit topics.
+
+        Args:
+            doc_ids: Iterable of document ids to consider (default: all docs).
+            mode: Scoring mode for suggestions.
+            neighbor_k: k parameter for neighbor-vote scoring.
+            threshold: Minimum score to accept reassignment (default: infinity, i.e., no reassignment).
+            validate_reassignments: Whether to mark reassigned docs as validated.
+            ignore_consensus: Whether to skip docs where suggested topic matches current.
+            export_path: Optional path to export suggestions CSV.
+
+        Returns:
+            A DataFrame with suggested assignments.
+        """
         self._require_fitted()
+
+        if doc_ids is None:
+            doc_ids = self._doc_ids
 
         results = []
         to_reassign: Dict[int, Tuple[int, float]] = {}
 
         for doc_id in doc_ids:
-            suggested_topic_id, score = self.suggest_assignment(
-                doc_id, mode=mode, threshold=threshold
+            suggested_topic_id, (score, support) = self.suggest_assignment(
+                doc_id, mode=mode, neighbor_k=neighbor_k
             )
             suggested_topic = suggested_topic_id if suggested_topic_id is not None else self.OUTLIER_ID
+            current_topic = int(self._assignments[self._pos(doc_id)])
+
+            if ignore_consensus and suggested_topic == current_topic:
+                continue
+
             suggested_label = (
                 self.topics[suggested_topic].label if suggested_topic in self.topics else None
             )
+            current_label = (
+                self.topics[current_topic].label if current_topic in self.topics else None
+            )
             row = {
                 "doc_id": doc_id,
-                "current_topic": int(self._assignments[self._pos(doc_id)]),
+                "current_topic": current_topic,
+                "current_label": current_label,
                 "suggested_topic": suggested_topic,
                 "suggested_label": suggested_label,
                 "score": float(score),
+                "support": float(support),
                 "text": self._texts[self._pos(doc_id)],
                 "reassigned": False,
             }
             results.append(row)
 
-            if auto_reassign and score >= threshold:
+            if score >= threshold:
                 to_reassign[doc_id] = (int(suggested_topic), float(score))
 
-        df = pd.DataFrame(results)
+        df = pd.DataFrame(results).sort_values(['score', 'support'], ascending=[False, False])
 
         if export_path is not None:
             df['reassigned_topic_id'] = ''
             df.to_csv(export_path, index=False)
 
-        if not auto_reassign or not to_reassign:
+        if not to_reassign:
             return df
 
         old_assignments: Dict[int, int] = {}
@@ -1910,7 +2306,7 @@ class InteractiveTopicModel:
             self._strengths[pos] = float(new_score)
             new_strengths[doc_id] = float(new_score)
 
-            if validate_refits:
+            if validate_reassignments:
                 self._validated[pos] = True
                 new_validated[doc_id] = True
 
@@ -1924,20 +2320,21 @@ class InteractiveTopicModel:
         forward = {"assignments": new_assignments, "strengths": new_strengths}
         backward = {"assignments": old_assignments, "strengths": old_strengths}
 
-        if validate_refits:
+        if validate_reassignments:
             forward["validated"] = new_validated
             backward["validated"] = old_validated
 
         description = f"Refit docs: reassigned {len(new_assignments)}"
         return forward, backward, description, df
 
-    def refit_outliers(
+    def reassign_outliers(
         self,
         *,
-        mode: Optional[Union[str, Any]] = None,
-        threshold: float = 0.0,
-        validate_refits: bool = True,
-        auto_reassign: bool = False,
+        mode: Optional[Union[str, Any]] = "neighbors",
+        neighbor_k: Optional[int] = None,
+        threshold: float = float('+inf'),
+        validate_reassignments: bool = True,
+        ignore_consensus: bool = True,
         export_path: Optional[str] = None,
     ):
         self._require_fitted()
@@ -1945,12 +2342,13 @@ class InteractiveTopicModel:
         outlier_mask = self._assignments == self.OUTLIER_ID
         outlier_doc_ids = [int(doc_id) for doc_id in self._doc_ids[outlier_mask]]
 
-        return self.refit_docs(
-            outlier_doc_ids,
+        return self.reassign_docs(
+            doc_ids=outlier_doc_ids,
             mode=mode,
+            neighbor_k=neighbor_k,
             threshold=threshold,
-            validate_refits=validate_refits,
-            auto_reassign=auto_reassign,
+            validate_reassignments=validate_reassignments,
+            ignore_consensus=ignore_consensus,
             export_path=export_path,
         )
     
@@ -2666,7 +3064,7 @@ class InteractiveTopicModel:
 
             rows.append(row)
 
-        df = pd.DataFrame(rows)
+        df = pd.DataFrame(rows).sort_values(by=[f"sim_{i}" for i in range(len(queries))], ascending=[False]*len(queries))
 
         return df
     
