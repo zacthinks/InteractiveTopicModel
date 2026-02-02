@@ -34,8 +34,9 @@ from .data_structures import Edit, SplitPreview
 def undoable(func: Callable) -> Callable:
     """
     Decorator for operations that create undo/redo history.
-    
-    The decorated function should return (forward_state, backward_state, description).
+
+    The decorated function should record its undo/redo state via
+    itm._record_edit(forward_state, backward_state, description).
     """
     
     @wraps(func)
@@ -50,37 +51,51 @@ def undoable(func: Callable) -> Callable:
             return func(self, *args, **kwargs)
         
         # Skip tracking if disabled
-        if not itm._tracking_enabled or _disable_tracking:
+        if not itm._tracking_enabled:
             return func(self, *args, **kwargs)
         
-        # Execute function to get state changes
-        result = func(self, *args, **kwargs)
+        # If _disable_tracking=True, temporarily disable tracking
+        if _disable_tracking:
+            old_value = itm._tracking_enabled
+            itm._tracking_enabled = False
+            try:
+                return func(self, *args, **kwargs)
+            finally:
+                itm._tracking_enabled = old_value
         
-        # If function returns state changes, create edit
-        if isinstance(result, tuple) and len(result) >= 3:
-            r_len = len(result)
-            forward_state, backward_state, description = result[:3]
-            
-            edit = Edit(
-                operation=func.__name__,
-                timestamp=datetime.now(),
-                forward_state=forward_state,
-                backward_state=backward_state,
-                description=description,
-            )
-            
-            # Add to undo stack and clear redo stack
-            itm._undo_stack.append(edit)
-            itm._redo_stack.clear()
-            
-            # inside undoable wrapper, replace this block:
-            if len(result) > 3:
-                extras = result[3:]
-                return extras[0] if len(extras) == 1 else extras
-            else:
-                return None
-        
-        return result
+        itm._begin_edit_store()
+        try:
+            result = func(self, *args, **kwargs)
+        except Exception:
+            # Do not record edits on failure.
+            raise
+        else:
+            store = itm._edit_store
+            if store is not None:
+                forward_state = store.get("forward_state")
+                backward_state = store.get("backward_state")
+                description = store.get("description")
+
+                if (
+                    forward_state is not None
+                    and backward_state is not None
+                    and description is not None
+                ):
+                    edit = Edit(
+                        operation=func.__name__,
+                        timestamp=datetime.now(),
+                        forward_state=forward_state,
+                        backward_state=backward_state,
+                        description=description,
+                    )
+
+                    # Add to undo stack and clear redo stack
+                    itm._undo_stack.append(edit)
+                    itm._redo_stack.clear()
+
+            return result
+        finally:
+            itm._clear_edit_store()
     
     return wrapper
 
@@ -210,7 +225,6 @@ class BasicTopicModel:
             Dictionary with 'labels' and 'strengths' arrays (positional order).
         """
         texts = [self.itm._texts[self.itm._pos(doc_id)] for doc_id in doc_ids]
-        
         # Build doc_id mapping
         self._doc_id_to_pos = {doc_id: i for i, doc_id in enumerate(doc_ids)}
         self._pos_to_doc_id = list(doc_ids)
@@ -599,7 +613,7 @@ class InteractiveTopic:
         self._set_label(value)
     
     @undoable
-    def _set_label(self, value: str) -> Tuple[Dict, Dict, str]:
+    def _set_label(self, value: str) -> None:
         """Internal label setter with undo support."""
         if value == self._label:
             return
@@ -610,8 +624,9 @@ class InteractiveTopic:
         forward = {"topic_labels": {self.topic_id: value}}
         backward = {"topic_labels": {self.topic_id: old_label}}
         description = f"Set label for topic {self.topic_id} to '{value}'"
-        
-        return forward, backward, description
+
+        self.itm._record_edit(forward, backward, description)
+        return None
     
     @property
     def semantic_space(self) -> BasicTopicModel:
@@ -1050,7 +1065,7 @@ class InteractiveTopic:
 
     
     @undoable
-    def auto_label(self, n: int = 4) -> Tuple[Dict, Dict, str]:
+    def auto_label(self, n: int = 4) -> Optional[str]:
         """
         Set automatic label from top terms.
         
@@ -1064,8 +1079,9 @@ class InteractiveTopic:
         forward = {"topic_labels": {self.topic_id: new_label}}
         backward = {"topic_labels": {self.topic_id: old_label}}
         description = f"Auto-labeled topic {self.topic_id}"
-        
-        return forward, backward, description
+
+        self.itm._record_edit(forward, backward, description)
+        return new_label
     
     # ----------------------------
     # Split operations
@@ -1207,8 +1223,8 @@ class InteractiveTopic:
     def commit_split(
         self, 
         new_topic_labels: Dict[str, str]=None,
-        delete_parent: bool = False
-    ) -> Tuple[Dict, Dict, str]:
+        delete_parent: bool = True
+    ) -> List[int]:
         """
         Commit the previewed split.
 
@@ -1219,7 +1235,7 @@ class InteractiveTopic:
                         Not allowed if the preview created a new semantic space (preview.btm).
         
         Returns:
-            Tuple of (forward_state, backward_state, description) for undo/redo.
+            List of newly created topic IDs.
         """
         if self._split_preview is None:
             raise ITMError("No split preview to commit. Call preview_split() first.")
@@ -1229,11 +1245,8 @@ class InteractiveTopic:
 
         old_btm = self.btm
         new_btm = getattr(preview, "btm", None)
+        has_new_btm = new_btm is not None
     
-        # If the preview created a new semantic space, we cannot delete the parent.
-        if delete_parent and new_btm is not None:
-            raise ITMError("Cannot delete parent when the preview created a new semantic space.")
-        
         # Verify no documents have changed assignment since preview
         for doc_id in preview.proposed_assignments.keys():
             pos = self.itm._pos(doc_id)
@@ -1249,7 +1262,7 @@ class InteractiveTopic:
         placeholder_to_real: Dict[object, int] = {}
         real_new_topic_ids: list[int] = []
 
-        parent_for_new_topics = self.parent if (delete_parent or (self.topic_id == self.itm.OUTLIER_ID)) else self
+        parent_for_new_topics = self.parent if (delete_parent and not has_new_btm) or (self.topic_id == self.itm.OUTLIER_ID) else self
 
         for pid in preview.new_topic_ids:
             # If it's already an int (e.g., parent topic id or OUTLIER_ID), skip
@@ -1321,7 +1334,7 @@ class InteractiveTopic:
             "strengths": old_strengths,
             "remove_topics": real_new_topic_ids.copy(),
         }
-        if delete_parent:
+        if delete_parent and not has_new_btm:
             # Gather children *before* we remove the topic so we can restore links later.
             children_ids = [t.topic_id for t in self.itm.topics.values() if getattr(t, "parent", None) is self]
 
@@ -1356,11 +1369,12 @@ class InteractiveTopic:
             backward["topic_btms"] = {self.topic_id: old_btm}
         
         description = f"Split topic {self.topic_id} into {len(real_new_topic_ids)} new topics"
-        
-        return forward, backward, description
+
+        self.itm._record_edit(forward, backward, description)
+        return real_new_topic_ids
 
     @undoable
-    def junk(self) -> Tuple[Dict, Dict, str]:
+    def junk(self) -> None:
         """
         Mark this topic as junk by moving all documents to outliers,
         relabeling it as [JUNK], and deactivating it.
@@ -1421,8 +1435,9 @@ class InteractiveTopic:
             backward["reactivate_topics"] = [self.topic_id]
         
         description = f"Junked topic {self.topic_id}, moved {len(doc_ids)} documents to outliers"
-        
-        return forward, backward, description
+
+        self.itm._record_edit(forward, backward, description)
+        return None
 
     def visualize_documents(
         self,
@@ -1626,6 +1641,7 @@ class InteractiveTopicModel:
         self._undo_stack: List[Edit] = []
         self._redo_stack: List[Edit] = []
         self._tracking_enabled = True
+        self._edit_store: Optional[Dict[str, Any]] = None
         
         # Create outlier topic
         self._ensure_topic(self.OUTLIER_ID, label="Outliers", parent=self)
@@ -1656,6 +1672,39 @@ class InteractiveTopicModel:
         """Raise error if model not fitted."""
         if not self._fitted:
             raise NotFittedError("Model must be fitted before this operation")
+
+    def _begin_edit_store(self) -> None:
+        """Initialize a per-call edit store for undo/redo tracking."""
+        if self._edit_store is not None:
+            raise ITMError(
+                "Nested undoable call detected. Use disable_tracking or _disable_tracking."
+            )
+        self._edit_store = {
+            "forward_state": None,
+            "backward_state": None,
+            "description": None,
+        }
+
+    def _record_edit(self, forward_state: Dict, backward_state: Dict, description: str) -> None:
+        """Record the undo/redo state for the active undoable call."""
+        # If tracking is disabled, ignore this record attempt (e.g., _disable_tracking=True)
+        if not self._tracking_enabled:
+            return
+        
+        if self._edit_store is None:
+            # No active store (e.g., tracking disabled). Ignore.
+            return
+
+        if self._edit_store.get("forward_state") is not None:
+            raise ITMError("Edit already recorded for this operation")
+
+        self._edit_store["forward_state"] = forward_state
+        self._edit_store["backward_state"] = backward_state
+        self._edit_store["description"] = description
+
+    def _clear_edit_store(self) -> None:
+        """Clear the active edit store."""
+        self._edit_store = None
     
     def _new_topic_id(self) -> int:
         """Generate new unique topic ID."""
@@ -1792,7 +1841,7 @@ class InteractiveTopicModel:
     @undoable
     def assign_doc(
         self, doc_id: int, topic_id: int, strength: float = 1.0, validated: bool = True
-    ) -> Tuple[Dict, Dict, str]:
+    ) -> None:
         """
         Assign a document to a topic.
         
@@ -1803,7 +1852,7 @@ class InteractiveTopicModel:
             validated: Whether to mark as validated.
             
         Returns:
-            Tuple of (forward_state, backward_state, description).
+            None
         """
         self._require_fitted()
         pos = self._pos(doc_id)
@@ -1841,8 +1890,9 @@ class InteractiveTopicModel:
         }
         
         description = f"Assigned doc {doc_id} to topic {topic_id}"
-        
-        return forward, backward, description
+
+        self._record_edit(forward, backward, description)
+        return None
     
     @undoable
     def manual_reassign(
@@ -1851,7 +1901,7 @@ class InteractiveTopicModel:
         *,
         strength: float = 1.0, 
         validated: bool = True
-    ) -> Tuple[Dict, Dict, str, Dict[str, int]]:
+    ) -> Dict[str, int]:
         self._require_fitted()
 
         old_assignments: Dict[int, int] = {}
@@ -1896,7 +1946,9 @@ class InteractiveTopicModel:
 
         description = f"Reassigned {len(new_assignments)} documents"
         summary = {"reassigned": len(new_assignments)}
-        return forward, backward, description, summary
+
+        self._record_edit(forward, backward, description)
+        return summary
 
     @undoable
     def assign_docs_to_topic(
@@ -1905,7 +1957,7 @@ class InteractiveTopicModel:
         topic_id: int,
         *,
         set_validation: Optional[bool] = None,
-    ) -> Tuple[Dict, Dict, str]:
+    ) -> int:
         """
         Assign the given documents to a topic.
 
@@ -1917,7 +1969,7 @@ class InteractiveTopicModel:
                 - True / False: set validation status for these docs
 
         Returns:
-            (forward_state, backward_state, description)
+            Number of documents newly assigned.
         """
         self._require_fitted()
 
@@ -1975,7 +2027,10 @@ class InteractiveTopicModel:
         if set_validation is not None:
             desc += f" (validation set to {set_validation})"
 
-        return forward, backward, desc
+        if forward:
+            self._record_edit(forward, backward, desc)
+
+        return len(forward_assignments)
 
     def assign_docs_to_outlier(
         self,
@@ -1993,7 +2048,7 @@ class InteractiveTopicModel:
         )
 
     @undoable
-    def validate_doc(self, doc_id: int) -> Tuple[Dict, Dict, str]:
+    def validate_doc(self, doc_id: int) -> None:
         """
         Mark a document as validated.
         
@@ -2001,7 +2056,7 @@ class InteractiveTopicModel:
             doc_id: Document ID.
             
         Returns:
-            Tuple of (forward_state, backward_state, description).
+            None
         """
         pos = self._pos(doc_id)
         old_validated = bool(self._validated[pos])
@@ -2011,8 +2066,9 @@ class InteractiveTopicModel:
         forward = {"validated": {doc_id: True}}
         backward = {"validated": {doc_id: old_validated}}
         description = f"Validated doc {doc_id}"
-        
-        return forward, backward, description
+
+        self._record_edit(forward, backward, description)
+        return None
     
     # ----------------------------
     # Suggest assignment
@@ -2026,6 +2082,14 @@ class InteractiveTopicModel:
     ) -> Tuple[Optional[int], Tuple[float, float]]:
         """
         Suggest best LEAF topic for a document, respecting semantic spaces.
+
+        Args:
+            doc_id: Document ID.
+            mode: Scoring mode for suggestions. One of:
+                - "neighbors": use neighbor-vote scorer (default)
+                - "embeddings": use embedding similarity scorer
+                - "tfidf": use TF-IDF similarity scorer
+                - "harmonic": use harmonic mean of embedding and TF-IDF scorers
         """
         self._require_fitted()
 
@@ -2044,7 +2108,7 @@ class InteractiveTopicModel:
             mode = "neighbors"
 
         use_neighbors = False
-        if mode == "embedding":
+        if mode == "embeddings":
             scorer = embedding_scorer
         elif mode == "tfidf":
             scorer = tfidf_scorer
@@ -2228,7 +2292,7 @@ class InteractiveTopicModel:
 
         Args:
             doc_ids: Iterable of document ids to consider (default: all docs).
-            mode: Scoring mode for suggestions.
+            mode: Scoring mode for suggestions. See suggest_assignment().
             neighbor_k: k parameter for neighbor-vote scoring.
             threshold: Minimum score to accept reassignment (default: infinity, i.e., no reassignment).
             validate_reassignments: Whether to mark reassigned docs as validated.
@@ -2325,7 +2389,8 @@ class InteractiveTopicModel:
             backward["validated"] = old_validated
 
         description = f"Refit docs: reassigned {len(new_assignments)}"
-        return forward, backward, description, df
+        self._record_edit(forward, backward, description)
+        return df
 
     def reassign_outliers(
         self,
@@ -2356,18 +2421,14 @@ class InteractiveTopicModel:
     # Topic operations
     # ----------------------------
     
-    @undoable
-    def merge_topics(
+    def _merge_topics_state(
         self,
         topic_ids: List[int],
+        *,
         new_label: Optional[str] = None,
-    ) -> Tuple[Dict, Dict, str]:
-        """
-        Merge multiple topics into one, with hierarchy rules:
-        - Topics can only be merged if they are siblings (same parent object).
-        - If any merged topics have children, those children are reparented to the new merged topic.
-        - Only documents assigned directly to the merged topics (exclude descendants) are moved.
-        """
+        raise_on_parent_mismatch: bool = True,
+    ) -> Optional[Tuple[Dict, Dict, str, int]]:
+        """Merge topics and return undo/redo state without recording."""
         self._require_fitted()
 
         # normalize + validate ids
@@ -2382,25 +2443,28 @@ class InteractiveTopicModel:
         if self.OUTLIER_ID in topic_ids:
             raise ValueError("Cannot merge the outlier topic")
 
-        # siblings-only constraint 
+        # siblings-only constraint
         parents = [self.topics[tid].parent for tid in topic_ids]
         parent0 = parents[0]
         if any(p is not parent0 for p in parents[1:]):
-            raise ITMError("Can only merge sibling topics (topics must share the same parent).")
+            if raise_on_parent_mismatch:
+                raise ITMError("Can only merge sibling topics (topics must share the same parent).")
+            else:
+                return None
 
-        # create merged topic under the shared parent 
+        # create merged topic under the shared parent
         merged_id = self._new_topic_id()
         self._ensure_topic(merged_id, label=new_label, parent=parent0)
         merged_topic = self.topics[merged_id]
 
-        # capture old state for undo 
+        # capture old state for undo
         old_assignments: Dict[int, int] = {}
 
         # parent-relabel bookkeeping for children reparenting
         forward_topic_parents: Dict[int, object] = {merged_id: parent0}
         backward_topic_parents: Dict[int, object] = {}
 
-        # move docs (direct only) + deactivate originals 
+        # move docs (direct only) + deactivate originals
         moved_doc_ids: List[int] = []
 
         for tid in topic_ids:
@@ -2419,7 +2483,7 @@ class InteractiveTopicModel:
 
             t.active = False
 
-        # reparent any children of merged topics to the new merged topic 
+        # reparent any children of merged topics to the new merged topic
         # (children are topics whose parent is one of the merged topics)
         for child in list(self.topics.values()):
             if not isinstance(child.parent, InteractiveTopic):
@@ -2429,13 +2493,13 @@ class InteractiveTopicModel:
                 child.parent = merged_topic
                 forward_topic_parents[child.topic_id] = merged_topic
 
-        # invalidate representations 
+        # invalidate representations
         for tid in topic_ids:
             if tid in self.topics:
                 self.topics[tid].invalidate_representations()
         merged_topic.invalidate_representations()
 
-        # undo/redo payloads 
+        # undo/redo payloads
         forward = {
             "assignments": {doc_id: merged_id for doc_id in moved_doc_ids},
             "new_topic": merged_id,
@@ -2465,6 +2529,26 @@ class InteractiveTopicModel:
         return forward, backward, description, merged_id
 
     @undoable
+    def merge_topics(
+        self,
+        topic_ids: List[int],
+        new_label: Optional[str] = None,
+    ) -> int:
+        """
+        Merge multiple topics into one.
+        
+        If any merged topics have children, those children are reparented to the new merged topic.
+        Only documents assigned directly to the merged topics (exclude descendants) are moved.
+        """
+        forward, backward, description, merged_id = self._merge_topics_state(
+            topic_ids,
+            new_label=new_label,
+        )
+
+        self._record_edit(forward, backward, description)
+        return merged_id
+
+    @undoable
     def merge_similar_topics(
         self,
         threshold: float,
@@ -2474,7 +2558,7 @@ class InteractiveTopicModel:
         include_inactive: bool = True,
         linkagefun: Optional[Callable] = None,
         new_label_fn: Optional[Callable[[List[int]], str]] = None,
-    ) -> Tuple[Dict, Dict, str, List[int]]:
+    ) -> List[int]:
         """
         Merge sibling clusters under `parent` whose linkage distances are <= threshold.
 
@@ -2493,7 +2577,7 @@ class InteractiveTopicModel:
         child_topic_ids = [int(t) for t in child_topic_ids]
 
         if len(child_topic_ids) < 2:
-            return {}, {}, "No merge performed (fewer than 2 children).", []
+            return []
 
         from scipy.cluster.hierarchy import fcluster
 
@@ -2506,7 +2590,7 @@ class InteractiveTopicModel:
 
         merge_groups = [sorted(g) for g in groups.values() if len(g) >= 2]
         if not merge_groups:
-            return {}, {}, "No merge performed (no clusters below threshold).", []
+            return []
 
         # compose undo states across multiple merge_topics calls
         forward_all: Dict[str, Any] = {}
@@ -2528,16 +2612,24 @@ class InteractiveTopicModel:
                     # Handle new keys here.
                     dst[k] = v
 
-        # Disable tracking for inner merges; merge_similar_topics is the only undo step.
-        with disable_tracking(self):
-            for group in merge_groups:
-                label = new_label_fn(group) if new_label_fn else None
+        for group in merge_groups:
+            label = new_label_fn(group) if new_label_fn else None
 
-                fwd, bwd, _desc, merged_id = self.merge_topics(group, new_label=label, _disable_tracking=True)
-                merged_ids.append(int(merged_id))
+            result = self._merge_topics_state(group, new_label=label, raise_on_parent_mismatch=False)
+            if result is None:
+                # Parent mismatch - skip this group with a warning
+                parent_info = ", ".join(
+                    f"topic {tid} (parent: {getattr(self.topics[tid].parent, 'topic_id', 'ITM')})"
+                    for tid in group
+                )
+                print(f"Warning: Skipping merge of [{parent_info}] - topics must share the same parent")
+                continue
+            
+            fwd, bwd, _desc, merged_id = result
+            merged_ids.append(int(merged_id))
 
-                _merge_state(forward_all, fwd)
-                _merge_state(backward_all, bwd)
+            _merge_state(forward_all, fwd)
+            _merge_state(backward_all, bwd)
 
         # Clean up duplicates / make deterministic
         if "new_topics" in forward_all:
@@ -2555,13 +2647,14 @@ class InteractiveTopicModel:
         )
         print(desc)
 
-        return forward_all, backward_all, desc, merged_ids
+        self._record_edit(forward_all, backward_all, desc)
+        return merged_ids
 
     @undoable
     def merge_topics_by_label(
         self,
         exclude_inactive: bool = True,
-    ) -> Tuple[Dict, Dict, str, List[int]]:
+    ) -> List[int]:
         """
         Merge topics that share the same label, but only when they are siblings.
 
@@ -2569,7 +2662,7 @@ class InteractiveTopicModel:
             exclude_inactive: If True, skip inactive topics.
 
         Returns:
-            (forward_state, backward_state, description, merged_topic_ids)
+            List of merged topic IDs.
         """
         self._require_fitted()
 
@@ -2594,7 +2687,7 @@ class InteractiveTopicModel:
                 merge_groups.append((parent_obj, label, tids))
 
         if not merge_groups:
-            return {}, {}, "No topics with duplicate labels found (among siblings).", []
+            return []
 
         # Compose undo/redo states across multiple merge_topics calls (same as merge_similar_topics).
         forward_all: Dict[str, Any] = {}
@@ -2615,18 +2708,25 @@ class InteractiveTopicModel:
                 else:
                     dst[k] = v
 
-        # Disable tracking for inner merges; merge_topics_by_label is the only undo step.
-        with disable_tracking(self):
-            for _parent_obj, label, tids in merge_groups:
-                # merge_topics enforces siblings-only itself, but grouping by parent prevents failures up front.
-                fwd, bwd, _desc, merged_id = self.merge_topics(
-                    tids,
-                    new_label=label,
-                    _disable_tracking=True,
+        for _parent_obj, label, tids in merge_groups:
+            result = self._merge_topics_state(
+                tids,
+                new_label=label,
+                raise_on_parent_mismatch=False,
+            )
+            if result is None:
+                # Parent mismatch - skip this group with a warning
+                parent_info = ", ".join(
+                    f"topic {tid} (parent: {getattr(self.topics[tid].parent, 'topic_id', 'ITM')})"
+                    for tid in tids
                 )
-                merged_ids.append(int(merged_id))
-                _merge_state(forward_all, fwd)
-                _merge_state(backward_all, bwd)
+                print(f"Warning: Skipping merge of label '{label}' [{parent_info}] - topics must share the same parent")
+                continue
+            
+            fwd, bwd, _desc, merged_id = result
+            merged_ids.append(int(merged_id))
+            _merge_state(forward_all, fwd)
+            _merge_state(backward_all, bwd)
 
         # Clean up duplicates / determinism
         if "new_topics" in forward_all:
@@ -2640,7 +2740,8 @@ class InteractiveTopicModel:
 
         merged_count = sum(len(tids) for _, _, tids in merge_groups)
         desc = f"Merged {merged_count} topics across {len(merge_groups)} sibling-label groups."
-        return forward_all, backward_all, desc, merged_ids
+        self._record_edit(forward_all, backward_all, desc)
+        return merged_ids
 
     @undoable
     def create_topic(
@@ -2663,7 +2764,7 @@ class InteractiveTopicModel:
             confidence: Optional confidence score for assignments.
 
         Returns:
-            (forward_state, backward_state, description, topic)
+            The newly created topic.
         """
         self._require_fitted()
 
@@ -2736,12 +2837,12 @@ class InteractiveTopicModel:
 
         description = f"Created topic {topic_id}" + (f" ('{label}')" if label else "")
 
-        # Extra return: topic object
-        return forward, backward, description, topic
+        self._record_edit(forward, backward, description)
+        return topic
 
 
     @undoable
-    def rename_topic(self, topic_id: int, label: str) -> Tuple[Dict, Dict, str]:
+    def rename_topic(self, topic_id: int, label: str) -> None:
         """
         Rename a topic.
         
@@ -2750,7 +2851,7 @@ class InteractiveTopicModel:
             label: New label.
             
         Returns:
-            Tuple of (forward_state, backward_state, description).
+            None
         """
         if topic_id not in self.topics:
             raise ValueError(f"Unknown topic_id: {topic_id}")
@@ -2762,8 +2863,9 @@ class InteractiveTopicModel:
         forward = {"topic_labels": {topic_id: label}}
         backward = {"topic_labels": {topic_id: old_label}}
         description = f"Renamed topic {topic_id} to '{label}'"
-        
-        return forward, backward, description
+
+        self._record_edit(forward, backward, description)
+        return None
     
     # ----------------------------
     # Information retrieval
@@ -3071,7 +3173,7 @@ class InteractiveTopicModel:
     @undoable
     def label_topics(
         self, label_dict: Dict[int, str], skip_missing: bool = True
-    ) -> Tuple[Dict, Dict, str]:
+    ) -> int:
         """
         Bulk label topics.
         
@@ -3080,7 +3182,7 @@ class InteractiveTopicModel:
             skip_missing: If False, raise error for unknown topic_ids.
             
         Returns:
-            Tuple of (forward_state, backward_state, description).
+            Number of topics labeled.
         """
         old_labels = {}
         new_labels = {}
@@ -3098,11 +3200,14 @@ class InteractiveTopicModel:
         forward = {"topic_labels": new_labels}
         backward = {"topic_labels": old_labels}
         description = f"Labeled {len(new_labels)} topics"
-        
-        return forward, backward, description
+
+        if new_labels:
+            self._record_edit(forward, backward, description)
+
+        return len(new_labels)
     
     @undoable
-    def archive_topic(self, topic_id: int) -> Tuple[Dict, Dict, str]:
+    def archive_topic(self, topic_id: int) -> None:
         """
         Deactivate a topic (mark as inactive).
         
@@ -3112,7 +3217,7 @@ class InteractiveTopicModel:
             topic_id: Topic ID to archive.
             
         Returns:
-            Tuple of (forward_state, backward_state, description).
+            None
         """
         if topic_id not in self.topics:
             raise ValueError(f"Unknown topic_id: {topic_id}")
@@ -3123,13 +3228,14 @@ class InteractiveTopicModel:
         forward = {"topic_active": {topic_id: False}}
         backward = {"topic_active": {topic_id: old_active}}
         description = f"Archived topic {topic_id}"
-        
-        return forward, backward, description
+
+        self._record_edit(forward, backward, description)
+        return None
     
     @undoable
     def group_topics(
         self, topic_ids: List[int], label: Optional[str] = None
-    ) -> Tuple[Dict, Dict, str]:
+    ) -> InteractiveTopic:
         """
         Group existing topics under a new parent topic.
         
@@ -3141,7 +3247,7 @@ class InteractiveTopicModel:
             label: Optional label for the new parent topic.
             
         Returns:
-            Tuple of (forward_state, backward_state, description).
+            New parent topic.
         """
         if len(topic_ids) < 2:
             raise ValueError("Need at least 2 topics to group")
@@ -3184,8 +3290,83 @@ class InteractiveTopicModel:
             "topic_parents": old_parents,
         }
         description = f"Grouped {len(topic_ids)} topics under parent {parent_id}"
+
+        self._record_edit(forward, backward, description)
+        return parent
+    
+    @undoable
+    def ungroup_topics(
+        self, parent_topic_id: int, delete_parent: bool = True
+    ) -> List[int]:
+        """
+        Dissolve a parent topic container by moving its children up to the parent's parent.
         
-        return forward, backward, description
+        Args:
+            parent_topic_id: Topic ID of the parent container to dissolve.
+            delete_parent: If True, remove the parent topic entirely. If False, just deactivate it.
+            
+        Returns:
+            List of child topic IDs that were reparented.
+        """
+        if parent_topic_id not in self.topics:
+            raise ValueError(f"Unknown topic_id: {parent_topic_id}")
+        
+        parent_topic = self.topics[parent_topic_id]
+        grandparent = parent_topic.parent
+        
+        # Find all children of this parent
+        child_topics = [
+            t for t in self.topics.values()
+            if isinstance(getattr(t, "parent", None), InteractiveTopic)
+            and t.parent.topic_id == parent_topic_id
+        ]
+        
+        if not child_topics:
+            raise ValueError(f"Topic {parent_topic_id} has no children to ungroup")
+        
+        child_ids = [t.topic_id for t in child_topics]
+        
+        # Save old parent assignments for undo
+        old_parents = {t.topic_id: t.parent for t in child_topics}
+        
+        # Reparent children to grandparent
+        for child in child_topics:
+            child.parent = grandparent
+        
+        forward = {
+            "topic_parents": {tid: grandparent for tid in child_ids}
+        }
+        backward = {
+            "topic_parents": old_parents
+        }
+        
+        if delete_parent:
+            # Make a deep copy of the topic for undo
+            topic_snapshot = copy.deepcopy(parent_topic)
+            
+            # Remove from topics dict
+            self.topics.pop(parent_topic_id, None)
+            
+            backward.setdefault("restore_topics", {})[parent_topic_id] = {
+                "topic_snapshot": topic_snapshot,
+                "parent_id": getattr(grandparent, "topic_id", None) if isinstance(grandparent, InteractiveTopic) else None,
+                "child_ids": child_ids,
+            }
+            forward.setdefault("deleted_topics", []).append(parent_topic_id)
+            
+            description = f"Ungrouped {len(child_ids)} topics and deleted parent {parent_topic_id}"
+        else:
+            # Just deactivate
+            old_active = parent_topic.active
+            parent_topic.active = False
+            
+            forward["topic_active"] = {parent_topic_id: False}
+            backward["topic_active"] = {parent_topic_id: old_active}
+            
+            description = f"Ungrouped {len(child_ids)} topics and deactivated parent {parent_topic_id}"
+        
+        self._record_edit(forward, backward, description)
+        return child_ids
     
     # ----------------------------
     # Undo/redo
@@ -3476,7 +3657,7 @@ class InteractiveTopicModel:
         self,
         data: Union[str, pd.DataFrame],
         validate_imports: bool = True,
-    ) -> Tuple[Dict, Dict, str]:
+    ) -> int:
         """
         Import document reassignments from CSV or DataFrame.
         
@@ -3485,7 +3666,7 @@ class InteractiveTopicModel:
             validate_imports: If True, mark reassigned documents as validated.
             
         Returns:
-            Tuple of (forward_state, backward_state, description) for undo/redo.
+            Number of documents reassigned.
         """
         self._require_fitted()
         
@@ -3568,5 +3749,8 @@ class InteractiveTopicModel:
             backward["validated"] = old_validated
         
         description = f"Imported assignments for {len(new_assignments)} documents"
-        
-        return forward, backward, description
+
+        if new_assignments:
+            self._record_edit(forward, backward, description)
+
+        return len(new_assignments)
